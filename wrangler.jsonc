@@ -7,10 +7,23 @@
   // Keep-warm: a no-op scheduled tick every 5 minutes (see scheduled() in
   // src/index.js) so the first webhook after idle does not pay a cold start.
   "triggers": { "crons": ["*/5 * * * *"] },
-  "vars": { "HUMAN_AUDIO": "on" },
+  "vars": {
+    "HUMAN_AUDIO": "on",
+    // Public base for recorded voices (/record): the recorded/ prefix of
+    // the same R2 bucket the lesson media uses. A var, not a secret —
+    // it is a public URL. Without it, recorded voices fall back to the
+    // prebuilt voice (recordedAudioUrl is env-gated on this var).
+    "RECORDED_AUDIO_BASE_URL": "https://pub-e39b5be260724e0ea1bbf6a7db089987.r2.dev/recorded"
+  },
   "durable_objects": {
     "bindings": [{ "name": "USERS", "class_name": "UserStore" }]
   },
+  // Voice recording (/record): the Worker stores the admin's voice
+  // message in the same public R2 bucket the lesson media already uses
+  // (coptic-lessons), under recorded/<word-id>.<ext>. The playback path
+  // reads it back over the public base URL, never through this binding;
+  // the binding exists only so the Worker can PUT a new recording.
+  "r2_buckets": [{ "binding": "RECORDINGS", "bucket_name": "coptic-lessons" }],
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["UserStore"] }],
   "observability": {
     "enabled": true

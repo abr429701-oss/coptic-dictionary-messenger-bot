@@ -108,9 +108,9 @@ function makeParity(deps = {}) {
 test("admin audit covers all 332 Telegram commands exactly once, plus 2 Messenger extras", () => {
   const counts = adminAuditCounts();
   assert.equal(counts.total, 334);
-  assert.equal(counts.impl, 193);
+  assert.equal(counts.impl, 198);
   assert.equal(counts.dispatch, 57);
-  assert.equal(counts.na, 84);
+  assert.equal(counts.na, 79);
   const seen = new Set();
   for (const row of ADMIN_AUDIT) {
     assert.ok(!seen.has(row.command), `duplicate audit row: ${row.command}`);
@@ -128,7 +128,9 @@ test("admin audit covers all 332 Telegram commands exactly once, plus 2 Messenge
 test("admin audit statuses: Telegram-only, dispatch, and implemented samples", () => {
   assert.equal(adminCommandStatus("menuadmin").status, "na");
   assert.match(adminCommandStatus("menuadmin").reason, /تيليجرام/u);
-  assert.equal(adminCommandStatus("record").status, "na");
+  assert.equal(adminCommandStatus("record").status, "impl");
+  assert.equal(adminCommandStatus("record_choose").status, "impl");
+  assert.equal(adminCommandStatus("record_stop").status, "impl");
   assert.equal(adminCommandStatus("exportcsv").status, "na");
   assert.equal(adminCommandStatus("schedule").status, "na");
   assert.equal(adminCommandStatus("2fa").status, "na");
@@ -599,7 +601,7 @@ test("admin settings persist in the store: motd, feature, blacklist", async () =
 
 test("Telegram-only admin commands answer with the reason, never silence, never a crash", async () => {
   const parity = makeParity();
-  for (const cmd of ["/menuadmin", "/record", "/livemon", "/conversations", "/webhook", "/exportcsv", "/2fa", "/keyboard"]) {
+  for (const cmd of ["/menuadmin", "/livemon", "/conversations", "/webhook", "/exportcsv", "/2fa", "/keyboard"]) {
     const plan = await parity.handleText(ADMIN_PSID, cmd);
     assert.ok(plan?.texts?.[0]?.text?.includes("غير متاح على ماسنجر"), `${cmd} must explain why it is not applicable`);
   }
@@ -670,4 +672,156 @@ test("banned users get silence from parity handlers", async () => {
   assert.deepEqual(await parity.handlePick(USER_PSID, "learn|levels"), { texts: [], voiceUrl: null });
   const ok = await parity.handleText(ADMIN_PSID, "/learn");
   assert.match(ok.texts[0].text, /التعلم/u);
+});
+
+// ---------------------------------------------------------------------------
+// Voice recording (/record)
+// ---------------------------------------------------------------------------
+
+// Three words the fake dictionary knows; the fake nextUnrecorded mirrors
+// Telegram's voiceNext (first id with no recording, in dictionary order).
+// NOTE: the ids are 1/2/3 on purpose — the real baked-in manifest already
+// records 55 and 25344, and recordedIds() merges it, so reusing those ids
+// would make the fake dictionary look fully recorded.
+const RECORD_WORDS = [
+  { id: 1, coptic: "ⲁⲑⲙⲟϣⲓ", pronunciation: "athmoshi", english: "sneeze", meaning: "عطسة" },
+  { id: 2, coptic: "ⲁⲅⲅⲉⲗⲉⲓⲛ", pronunciation: "angelein", english: "angel", meaning: "ملاك" },
+  { id: 3, coptic: "ⲁ ⲁⲗⲫⲁ", pronunciation: "a alpha", english: "alpha", meaning: "ألفا" },
+];
+
+function makeRecordParity(overrides = {}) {
+  const saved = []; // { key, bytes, contentType }
+  const parity = makeParity({
+    putRecording: async (key, bytes, contentType) => {
+      saved.push({ key, bytes, contentType });
+      return { ok: true };
+    },
+    fetchImpl: async () => ({
+      ok: true,
+      headers: { get: (name) => (String(name).toLowerCase() === "content-type" ? "audio/mp4" : null) },
+      arrayBuffer: async () => new Uint8Array(210).buffer,
+    }),
+    searchWords: async (query) => RECORD_WORDS.filter(
+      (w) => w.coptic.includes(query) || w.english.includes(query) || w.meaning.includes(query),
+    ),
+    nextUnrecorded: async (recordedIds) => {
+      const next = RECORD_WORDS.find((w) => !recordedIds.has(String(w.id)));
+      if (!next) return null;
+      return { ...next, recorded: recordedIds.size, total: RECORD_WORDS.length };
+    },
+    ...overrides,
+  });
+  return { parity, saved };
+}
+
+const RECORD_AUDIO = { type: "audio", payload: { url: "https://cdn.test/voice.mp4" } };
+
+test("record: sequential session records the first unrecorded word, then advances", async () => {
+  const { parity, saved } = makeRecordParity();
+  const start = await parity.handleText(ADMIN_PSID, "/record");
+  assert.match(start.texts[0].text, /ⲁⲑⲙⲟϣⲓ/u);
+  assert.match(start.texts[0].text, /3 مرات/u, "the prompt asks for the word 3 times in one recording");
+  const done = await parity.handleAudio(ADMIN_PSID, RECORD_AUDIO);
+  assert.match(done.texts[0].text, /تم حفظ تسجيل/u);
+  assert.match(done.texts[0].text, /ⲁⲑⲙⲟϣⲓ/u);
+  assert.match(done.texts[0].text, /ⲁⲅⲅⲉⲗⲉⲓⲛ/u, "after saving, the next unrecorded word is prompted");
+  assert.equal(saved.length, 1);
+  assert.equal(saved[0].key, "recorded/1.mp4", "Messenger voice notes arrive as MP4/AAC and are stored raw");
+  assert.equal(saved[0].contentType, "audio/mp4");
+  assert.ok(saved[0].bytes.byteLength >= 100);
+});
+
+test("record: recording every word ends the session with the completion text", async () => {
+  const { parity } = makeRecordParity();
+  await parity.handleText(ADMIN_PSID, "/record");
+  for (const word of RECORD_WORDS) {
+    const done = await parity.handleAudio(ADMIN_PSID, RECORD_AUDIO);
+    assert.match(done.texts[0].text, new RegExp(word.coptic.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "u"));
+  }
+  const last = await parity.handleAudio(ADMIN_PSID, RECORD_AUDIO);
+  assert.match(last.texts[0].text, /لبدء التسجيل/u, "no session left once every word is recorded");
+});
+
+test("record_choose: search, bare-number pick, and quick-reply pick start a chosen recording", async () => {
+  const { parity, saved } = makeRecordParity();
+  const ask = await parity.handleText(ADMIN_PSID, "/record_choose");
+  assert.match(ask.texts[0].text, /أرسل الكلمة/u);
+  const list = await parity.handleText(ADMIN_PSID, "ⲁ");
+  assert.match(list.texts[0].text, /اختر الكلمة/u);
+  assert.match(list.texts[0].text, /أرسل رقمًا للاختيار/u);
+  assert.equal(list.menuList.kind, "record-choose");
+  assert.equal(list.menuList.items.length, 3);
+  const picked = await parity.handleText(ADMIN_PSID, "2");
+  assert.match(picked.texts[0].text, /ⲁⲅⲅⲉⲗⲉⲓⲛ/u, "bare number 2 picks the second listed word");
+  const done = await parity.handleAudio(ADMIN_PSID, RECORD_AUDIO);
+  assert.match(done.texts[0].text, /تم حفظ تسجيل/u);
+  assert.equal(saved[0].key, "recorded/2.mp4");
+  assert.match(done.texts[0].text, /أرسل كلمة أخرى/u, "chosen mode stays in choose mode after one recording");
+
+  const { parity: parity2 } = makeRecordParity();
+  await parity2.handleText(ADMIN_PSID, "/record_choose");
+  await parity2.handleText(ADMIN_PSID, "ⲁ");
+  const viaPayload = await parity2.handlePick(ADMIN_PSID, "record|pick:3");
+  assert.match(viaPayload.texts[0].text, /ⲁ ⲁⲗⲫⲁ/u, "record|pick:<id> quick reply starts the recording");
+});
+
+test("record: re-recording a word that already has one says it replaces the old recording", async () => {
+  const { parity, saved } = makeRecordParity();
+  await parity.handleText(ADMIN_PSID, "/record_choose");
+  await parity.handleText(ADMIN_PSID, "ⲁⲑⲙⲟϣⲓ");
+  const first = await parity.handleAudio(ADMIN_PSID, RECORD_AUDIO);
+  assert.doesNotMatch(first.texts[0].text, /استبدل/u);
+  await parity.handleText(ADMIN_PSID, "/record_choose");
+  await parity.handleText(ADMIN_PSID, "ⲁⲑⲙⲟϣⲓ");
+  const second = await parity.handleAudio(ADMIN_PSID, RECORD_AUDIO);
+  assert.match(second.texts[0].text, /استبدل التسجيل السابق/u);
+  assert.equal(saved.length, 2);
+  assert.equal(saved[1].key, "recorded/1.mp4", "re-record overwrites the same R2 key");
+});
+
+test("record: non-admins get silence; a voice with no session is told to send /record", async () => {
+  const { parity } = makeRecordParity();
+  assert.deepEqual(await parity.handleText(USER_PSID, "/record"), { texts: [], voiceUrl: null });
+  assert.deepEqual(await parity.handleAudio(USER_PSID, RECORD_AUDIO), { texts: [], voiceUrl: null });
+  const stray = await parity.handleAudio(ADMIN_PSID, RECORD_AUDIO);
+  assert.match(stray.texts[0].text, /\/record/u);
+});
+
+test("record: a failed download keeps the session open; /record_stop and /cancel end it", async () => {
+  const { parity, saved } = makeRecordParity({
+    fetchImpl: async () => ({ ok: false, headers: { get: () => null }, arrayBuffer: async () => new ArrayBuffer(0) }),
+  });
+  await parity.handleText(ADMIN_PSID, "/record");
+  const failed = await parity.handleAudio(ADMIN_PSID, RECORD_AUDIO);
+  assert.match(failed.texts[0].text, /تعذّر تنزيل الصوت/u);
+  assert.equal(saved.length, 0);
+  const noFile = await parity.handleAudio(ADMIN_PSID, { type: "audio", payload: {} });
+  assert.match(noFile.texts[0].text, /لم يصل أي ملف صوتي/u);
+  const stopped = await parity.handleText(ADMIN_PSID, "/record_stop");
+  assert.match(stopped.texts[0].text, /تم إيقاف جلسة التسجيل/u);
+  const afterStop = await parity.handleAudio(ADMIN_PSID, RECORD_AUDIO);
+  assert.match(afterStop.texts[0].text, /\/record/u);
+
+  const { parity: parity2 } = makeRecordParity();
+  await parity2.handleText(ADMIN_PSID, "/record");
+  const cancelled = await parity2.handleText(ADMIN_PSID, "/cancel");
+  assert.match(cancelled.texts[0].text, /تم الإلغاء/u);
+  const afterCancel = await parity2.handleAudio(ADMIN_PSID, RECORD_AUDIO);
+  assert.match(afterCancel.texts[0].text, /\/record/u, "/cancel clears the record session");
+});
+
+test("record: unwired deps answer with the not-wired text, never silence", async () => {
+  const parity = makeParity();
+  const plan = await parity.handleText(ADMIN_PSID, "/record");
+  assert.match(plan.texts[0].text, /غير موصّل/u);
+});
+
+test("record: voicecoverage counts the manifest plus the live overlay", async () => {
+  const { parity } = makeRecordParity();
+  const before = await parity.handleText(ADMIN_PSID, "/voicecoverage");
+  assert.match(before.texts[0].text, /2 كلمة/u, "the baked-in manifest has 55 and 25344");
+  await parity.handleText(ADMIN_PSID, "/record");
+  await parity.handleAudio(ADMIN_PSID, RECORD_AUDIO);
+  const after = await parity.handleText(ADMIN_PSID, "/voicecoverage");
+  assert.match(after.texts[0].text, /3 كلمة/u, "a fresh /record counts before its manifest line lands");
 });

@@ -13,7 +13,13 @@
 // on the Telegram Worker.
 
 import records from "../data/dictionary.json" with { type: "json" };
-import { messengerVoiceUrl } from "./neural-voice.js";
+import { messengerVoiceUrlWithOverlay, recordedFilenameForId } from "./neural-voice.js";
+import {
+  nextUnrecordedWord,
+  mp3Sibling,
+  recordedPlaybackUrl,
+  RECORDED_OVERLAY_KEY,
+} from "./record-voice.js";
 import {
   verifyMessengerSignature,
   handleMessengerWebhookBody,
@@ -76,6 +82,68 @@ import {
 // Tests import these from the entry point, as they did from the old one.
 export { localDictionaryCandidates } from "./messenger-core.js";
 export { UserStore } from "./userstore.js";
+
+// Live recorded-voice overlay (a fresh /record save lands in the DO
+// before its manifest line lands): the parity module writes it, the
+// playback path reads it. Cached in-isolate so a word card does not pay
+// a DO read + a HEAD per render. A failed read degrades to the manifest.
+const RECORDED_OVERLAY_TTL_MS = 60 * 1000;
+const RECORDED_MP3_CHECK_TTL_MS = 5 * 60 * 1000;
+const recordedOverlayCache = { at: 0, value: {} };
+const recordedMp3Cache = new Map();
+export function resetRecordedOverlayCache() {
+  recordedOverlayCache.at = 0;
+  recordedOverlayCache.value = {};
+  recordedMp3Cache.clear();
+}
+
+async function getRecordedOverlay(env) {
+  if (!env?.USERS) return {};
+  const now = Date.now();
+  if (now - recordedOverlayCache.at < RECORDED_OVERLAY_TTL_MS) return recordedOverlayCache.value;
+  let value = {};
+  try {
+    const res = await storeCall(env, { op: "get", key: RECORDED_OVERLAY_KEY });
+    if (res?.value && typeof res.value === "object" && !Array.isArray(res.value)) value = res.value;
+  } catch {
+    value = {};
+  }
+  recordedOverlayCache.value = value;
+  recordedOverlayCache.at = now;
+  return value;
+}
+
+async function recordedMp3Exists(env, base, filename, fetchImpl = globalThis.fetch) {
+  const sibling = mp3Sibling(filename);
+  if (!sibling) return false;
+  const url = recordedPlaybackUrl(base, sibling);
+  const now = Date.now();
+  const hit = recordedMp3Cache.get(url);
+  if (hit && now - hit.at < RECORDED_MP3_CHECK_TTL_MS) return hit.exists;
+  let exists = false;
+  try {
+    const res = await fetchImpl(url, { method: "HEAD", signal: AbortSignal.timeout(3000) });
+    exists = res?.ok === true;
+  } catch {
+    exists = false;
+  }
+  recordedMp3Cache.set(url, { at: now, exists });
+  return exists;
+}
+
+// Overlay-aware voice URL for one record: recorded (overlay > manifest,
+// .mp3 sibling preferred when the converter produced it), then the
+// prebuilt audio-manifest voice, then Joanna. Null when the word has no
+// voice at all.
+async function resolveMessengerVoice(env, record, fetchImpl = globalThis.fetch) {
+  if (!record || record.id == null) return null;
+  const base = env?.RECORDED_AUDIO_BASE_URL;
+  const overlay = await getRecordedOverlay(env);
+  const filename = recordedFilenameForId(record.id, overlay);
+  let mp3Exists = false;
+  if (base && filename) mp3Exists = await recordedMp3Exists(env, base, filename, fetchImpl);
+  return messengerVoiceUrlWithOverlay(env, record, overlay, { mp3Exists });
+}
 
 export default {
   async fetch(request, env, ctx) {
@@ -216,8 +284,8 @@ export default {
         if (record?.name) return null;
         const parity = record?.parity ?? {};
         const next = { ...(record ?? {}), awaitingName: true };
-        if (parity.certAwaiting || parity.getcodeStep || parity.getcodeName || parity.examAwaiting) {
-          next.parity = { ...parity, certAwaiting: undefined, getcodeStep: undefined, getcodeName: undefined, examAwaiting: undefined };
+        if (parity.certAwaiting || parity.getcodeStep || parity.getcodeName || parity.examAwaiting || parity.recordState || parity.recordPick) {
+          next.parity = { ...parity, certAwaiting: undefined, getcodeStep: undefined, getcodeName: undefined, examAwaiting: undefined, recordState: undefined, recordPick: undefined };
         }
         await saveUser(env, `msgr:${senderId}`, next);
         return { texts: [{ text: FIRST_TIME_TEXT }], voiceUrl: null };
@@ -235,6 +303,10 @@ export default {
         if (parity.getcodeStep) {
           await saveUser(env, `msgr:${senderId}`, { ...record, parity: { ...parity, getcodeStep: undefined, getcodeName: undefined } });
           return { texts: [{ text: "✅ تم إلغاء الحصول على الرقم الكودي." }], voiceUrl: null };
+        }
+        if (parity.recordState || parity.recordPick) {
+          await saveUser(env, `msgr:${senderId}`, { ...record, parity: { ...parity, recordState: undefined, recordPick: undefined } });
+          return { texts: [{ text: "✅ تم إيقاف جلسة التسجيل." }], voiceUrl: null };
         }
         return { texts: [{ text: "اكتب الكلمة مباشرة للبحث أو استخدم /start للبدء." }], voiceUrl: null };
       }
@@ -443,11 +515,11 @@ export default {
     // priority is Telegram's: recorded human first, then prebuilt Polly,
     // then Joanna (see messengerVoiceUrl in neural-voice.js). The ×3
     // repeat in the transport applies to whichever voice is served.
-    function messengerCardPlan(env, record, searchedWord, partIndex = -1) {
+    async function messengerCardPlan(env, record, searchedWord, partIndex = -1) {
       if (!record) return { texts: [], voiceUrl: null };
       return {
         texts: [{ text: plainTextCard(formatRecord(record, partIndex, searchedWord)) }],
-        voiceUrl: record.id != null ? messengerVoiceUrl(env, record) : null,
+        voiceUrl: record.id != null ? await resolveMessengerVoice(env, record) : null,
       };
     }
 
@@ -560,7 +632,7 @@ export default {
           const n = Number(folded);
           const globalAt = Number(live.page ?? 0) * MESSENGER_LIST_PAGE_SIZE + (n - 1);
           if (Number.isInteger(n) && n >= 1 && n <= MESSENGER_LIST_PAGE_SIZE && live.indices[globalAt] !== undefined) {
-            return messengerPickPlan(env, live.indices[globalAt]);
+            return await messengerPickPlan(env, live.indices[globalAt]);
           }
         }
       }
@@ -580,7 +652,7 @@ export default {
         if (result.candidates.length === 1 || result.exactCount === 1 || sameWord) {
           const candidate = result.candidates[0];
           const record = records[candidate.row - 2];
-          return messengerCardPlan(env, record, text, matchedPartIndex(record, normalized));
+          return await messengerCardPlan(env, record, text, matchedPartIndex(record, normalized));
         }
         const items = messengerOrderItems(
           result.candidates
@@ -607,10 +679,10 @@ export default {
       return { texts: [{ text: uiTextFor(text).noResult }], voiceUrl: null };
     }
 
-    function messengerPickPlan(env, index) {
+    async function messengerPickPlan(env, index) {
       const record = records[index];
       if (!record) return { texts: [{ text: "لم أجد هذه الكلمة، ابحث عنها مرة أخرى." }], voiceUrl: null };
-      return messengerCardPlan(env, record, "", -1);
+      return await messengerCardPlan(env, record, "", -1);
     }
 
     // Meta verification: GET /messenger-webhook?hub.mode=subscribe&
@@ -710,6 +782,43 @@ export default {
         runUserCommand: null, // dispatch commands fall through to search
         getDictAudit: () => messengerDictAudit(env),
         deleteVoice: null, // voice files live on the audio branch / DO
+        // Voice recording (/record): Messenger voice attachments download
+        // as MP4/AAC and land in R2 recorded/<id>.<ext> via the RECORDINGS
+        // binding (wrangler.jsonc). The live DO overlay makes a fresh
+        // recording playable before its manifest line lands (the manifest
+        // syncs from the Telegram repo every 30 min). The converter
+        // script (scripts/convert-recorded.mjs) later produces the .mp3
+        // sibling so the recording also plays on WhatsApp/Telegram.
+        putRecording: async (key, bytes, contentType) => {
+          if (!env.RECORDINGS) return { ok: false, error: "r2-unconfigured" };
+          try {
+            await env.RECORDINGS.put(key, bytes, { httpMetadata: { contentType: contentType || "audio/mp4" } });
+            return { ok: true };
+          } catch (error) {
+            return { ok: false, error: error instanceof Error ? error.message : "r2-put-failed" };
+          }
+        },
+        fetchImpl: globalThis.fetch,
+        searchWords: async (query) => {
+          // /record_choose candidates: the same dictionary search the
+          // bot uses, capped at 15 (one Messenger list page).
+          const result = localDictionaryCandidates(query, 15);
+          if (!result?.ok) return [];
+          const seen = new Set();
+          const out = [];
+          for (const candidate of result.candidates ?? []) {
+            const record = records[candidate.row - 2];
+            if (!record || record.id == null || seen.has(String(record.id))) continue;
+            seen.add(String(record.id));
+            out.push({
+              id: record.id, coptic: record.coptic ?? "",
+              pronunciation: record.pronunciation ?? "",
+              english: record.english ?? "", meaning: record.meaning ?? "",
+            });
+          }
+          return out;
+        },
+        nextUnrecorded: async (recordedIds) => nextUnrecordedWord(records, recordedIds),
         getBroadcastControl: () => broadcastControlState(env),
         setBroadcastControl: async (patch) => { await setBroadcastControl(env, patch); return true; },
         getBroadcastStats: () => storeCall(env, { op: "bcstatus" }),
@@ -741,7 +850,7 @@ export default {
           const navDir = messengerListNavDirection(query);
           if (navDir !== 0 && senderId != null) {
             const parityState = await messengerParityLoadState(env, senderId);
-            const flowActive = Boolean(parityState?.certAwaiting || parityState?.getcodeStep || parityState?.examAwaiting || parityState?.pendingBroadcast || parityState?.pendingConfirm);
+            const flowActive = Boolean(parityState?.certAwaiting || parityState?.getcodeStep || parityState?.examAwaiting || parityState?.pendingBroadcast || parityState?.pendingConfirm || parityState?.recordPick);
             if (!flowActive && !parityState?.lastLessonId) {
               const dictList = await getMessengerLastList(env, senderId);
               const menuAt = parityState?.menuList ? Number(parityState.menuListAt ?? 0) : 0;
@@ -753,7 +862,7 @@ export default {
           const folded = messengerNormalizeDigits(String(query ?? "").trim());
           if (/^\d+$/u.test(folded) && senderId != null) {
             const parityState = await messengerParityLoadState(env, senderId);
-            const flowActive = Boolean(parityState?.certAwaiting || parityState?.getcodeStep || parityState?.examAwaiting || parityState?.pendingBroadcast || parityState?.pendingConfirm);
+            const flowActive = Boolean(parityState?.certAwaiting || parityState?.getcodeStep || parityState?.examAwaiting || parityState?.pendingBroadcast || parityState?.pendingConfirm || parityState?.recordPick);
             if (!flowActive) {
               const dictList = await getMessengerLastList(env, senderId);
               const menuAt = parityState?.menuList ? Number(parityState.menuListAt ?? 0) : 0;
@@ -781,6 +890,10 @@ export default {
           const index = Number(payload);
           return messengerPickPlan(env, index);
         },
+        // A voice message (audio attachment, no text): the /record flow
+        // owns it when an admin session is open; anything else stays
+        // silent (non-admin voices and stray voices are ignored).
+        audio: async (attachment, senderId) => messengerParity.handleAudio(senderId, attachment),
         executeTask: (task, senderId, fetchImpl) => executeMessengerTask(env, task, senderId, fetchImpl, { ctx }),
       };
       // Fast-ack like the Telegram webhook: answer Meta 200 immediately and

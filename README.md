@@ -16,6 +16,30 @@ registration, learn (27 lessons, R2 media), in-chat exam code gate,
 certificates, get-code, and the admin subset. No inline keyboards, ever:
 quick replies are the only tap mechanism.
 
+## Voice recording (/record)
+
+The admin records human voices for words, mirroring Telegram's
+`/record`: `/record` walks the dictionary in order (first word with
+no recording yet), `/record_choose` records a chosen word,
+`/record_stop` stops the session. The prompt asks the admin to say
+the word **3 times in one voice message** — the file then contains
+the word 3× natively, so it plays 3× everywhere with no repetition
+processing. A Messenger voice message arrives as an MP4/AAC audio
+attachment; the Worker downloads it and stores it in the public R2
+bucket `coptic-lessons` under `recorded/<word-id>.<ext>` (binding
+`RECORDINGS` in `wrangler.jsonc`). The recording plays on Messenger
+immediately through a Durable Object overlay (`recorded:overlay`) —
+before its manifest line lands — and the manifest is made permanent
+afterwards with `scripts/add-recorded-voice.mjs` (commit
+`data/recorded-voices.json` to the Telegram repo; the syncs pick it
+up). `scripts/convert-recorded.mjs` is OPTIONAL: it produces the
+`.mp3` (+ `.ogg`) siblings for WhatsApp/Telegram playback. MP3 is an
+optional fallback only — the raw recording plays as-is on Messenger,
+and the prebuilt-voice MP3 upload was stopped by the user on
+2026-11-16 (OGG already plays fine on Messenger as-is). A recording
+reaches Telegram only by sending the audio to the Telegram bot (it
+plays Telegram `file_id`s, which only it can mint).
+
 ## Routes
 
 - `GET /` — ready text
@@ -36,6 +60,10 @@ settings, so no Meta settings change was needed for the split.
 - `src/messenger.js` — transport: signature verify, Send API, typing,
   quick replies, voice attachments.
 - `src/messenger-parity.js` — learn / certs / get-code / admin.
+- `src/record-voice.js` — `/record` pure helpers (prompt, file names,
+  next-unrecorded-word, manifest + DO overlay merge, MP3-sibling
+  preference). `src/neural-voice.js` resolves playback through the
+  overlay (`messengerVoiceUrlWithOverlay`).
 - `src/messenger-core.js` — shared helpers extracted verbatim from the
   Telegram bot: search, cards, user state, Sheets/macro, exam codes,
   usage counting. `notifyAdmins` is a no-op here (no Telegram channel);
@@ -75,6 +103,12 @@ Set with `wrangler secret put --name coptic-dictionary-messenger-bot`:
 | `MESSENGER_PAGE_TOKEN` | Meta app dashboard → Messenger settings → Generate (Page: القاموس القبطي Ⲭⲏⲙⲓ) |
 | `MESSENGER_ADMIN_PSID` | The admin's page-scoped id |
 | `APPS_SCRIPT_URL` | The get-code Apps Script web app `/exec` URL (bootstrap for `drive-config`; without it get-code fails closed) |
+
+Worker vars (in `wrangler.jsonc`, not secrets — they are public):
+
+| Var | Value |
+|---|---|
+| `RECORDED_AUDIO_BASE_URL` | Public base for recorded voices: `https://pub-e39b5be260724e0ea1bbf6a7db089987.r2.dev/recorded` (without it, recorded voices fall back to the prebuilt voice) |
 
 GitHub secrets for CI deploys: `CLOUDFLARE_API_TOKEN`,
 `CLOUDFLARE_ACCOUNT_ID` (same values as the Telegram repo — same

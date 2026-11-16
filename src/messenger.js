@@ -379,14 +379,12 @@ export async function sendWordVoice(env, senderId, voiceUrl, fetchImpl = globalT
 // -----------------------------------------------------------------------------
 
 // One messaging event. planFor.text(query, senderId) /
-// planFor.pick(indexOrPayload, senderId) return a plan
+// planFor.pick(indexOrPayload, senderId) /
+// planFor.audio(attachment, senderId) return a plan
 // { texts: [{ text, quickReplies }], voiceUrl, attachments?, photoBytes?, task? }
-// or null to stay silent. planFor.pick receives a record index for a
-// `pick|<index>` quick reply, or the raw payload string for a parity quick
-// reply (`learn|...` / `cert|...` / `admin|...`) — the owning agent routes
-// by prefix. planFor.executeTask?.(task, senderId, fetchImpl) runs a plan's
-// side effect (broadcast, DM, import job) after the reply is sent; the
-// transport never invents a task.
+// or null to stay silent. planFor.audio fires for an incoming audio
+// attachment (a Messenger voice message) when the message carries no
+// text or quick reply — the /record flow owns it.
 // Send order per plan: typing_on first (the user sees "يكتب..." while the
 // plan is computed), then attachments (lesson media by URL), then a
 // photo upload, then the texts in order, then the voice — exactly one
@@ -419,6 +417,12 @@ export async function handleMessengerMessaging(env, event, planFor, fetchImpl = 
       plan = await planFor.pick(payload, senderId);
     } else if (typeof message.text === "string" && message.text.trim()) {
       plan = await planFor.text(message.text, senderId);
+    } else if (Array.isArray(message.attachments) && typeof planFor.audio === "function") {
+      // An audio attachment with no text: a voice message. Only the
+      // audio attachment is routed (photos/files stay silent here);
+      // planFor.audio decides whether a session owns the turn.
+      const audio = message.attachments.find((a) => a?.type === "audio");
+      if (audio) plan = await planFor.audio(audio, senderId);
     }
   } catch (error) {
     console.error("Messenger plan failed", error instanceof Error ? error.message : "unknown");

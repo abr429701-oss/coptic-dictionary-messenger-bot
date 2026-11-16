@@ -1101,3 +1101,68 @@ test("wiring: /cancel while waiting for the name does not clear the gate; /menu 
   calls = await sendMessengerText("منى علي حسن", { envOverride: kvEnv });
   assert.match(calls[1].payload.message.text, /مرحبًا بك منى علي حسن/u);
 });
+
+test("messenger audio attachment routes to planFor.audio, never to text search", async () => {
+  const seen = [];
+  const calls = [];
+  const fetchImpl = async (url, options = {}) => {
+    calls.push({ payload: JSON.parse(options.body) });
+    return Response.json({ recipient_id: SENDER_ID, message_id: "mid.test-1" });
+  };
+  const audioAttachment = { type: "audio", payload: { url: "https://cdn.test/voice.mp4" } };
+  const planFor = {
+    text: async () => { throw new Error("text must not run for a voice message"); },
+    pick: async () => null,
+    audio: async (attachment, senderId) => {
+      seen.push([attachment, senderId]);
+      return { texts: [{ text: "✅ تم حفظ تسجيل «ⲁⲑⲙⲟϣⲓ»." }], voiceUrl: null };
+    },
+  };
+  const event = {
+    sender: { id: SENDER_ID },
+    recipient: { id: PAGE_ID },
+    timestamp: 1794791000000,
+    message: { mid: "mid.audio", attachments: [audioAttachment] },
+  };
+  assert.equal(await handleMessengerMessaging(env, event, planFor, fetchImpl), true);
+  assert.deepEqual(seen, [[audioAttachment, SENDER_ID]]);
+  assert.equal(calls.at(-1).payload.message.text, "✅ تم حفظ تسجيل «ⲁⲑⲙⲟϣⲓ».");
+});
+
+test("messenger audio attachment is ignored when the message also has text", async () => {
+  const seen = [];
+  const fetchImpl = async (url, options = {}) => Response.json({ recipient_id: SENDER_ID, message_id: "mid.test-1" });
+  const planFor = {
+    text: async (query) => ({ texts: [{ text: `searched: ${query}` }], voiceUrl: null }),
+    pick: async () => null,
+    audio: async () => { seen.push("audio"); return { texts: [{ text: "must not run" }], voiceUrl: null }; },
+  };
+  const event = {
+    sender: { id: SENDER_ID },
+    recipient: { id: PAGE_ID },
+    timestamp: 1794791000000,
+    message: {
+      mid: "mid.audio-text",
+      text: "ⲁⲑⲙⲟϣⲓ",
+      attachments: [{ type: "audio", payload: { url: "https://cdn.test/voice.mp4" } }],
+    },
+  };
+  assert.equal(await handleMessengerMessaging(env, event, planFor, fetchImpl), true);
+  assert.deepEqual(seen, [], "text wins over the attachment");
+});
+
+test("messenger non-audio attachment with no text stays silent", async () => {
+  const fetchImpl = async (url, options = {}) => Response.json({ recipient_id: SENDER_ID, message_id: "mid.test-1" });
+  const planFor = {
+    text: async () => { throw new Error("text must not run for a photo"); },
+    pick: async () => null,
+    audio: async () => { throw new Error("audio must not run for a photo"); },
+  };
+  const event = {
+    sender: { id: SENDER_ID },
+    recipient: { id: PAGE_ID },
+    timestamp: 1794791000000,
+    message: { mid: "mid.photo", attachments: [{ type: "image", payload: { url: "https://cdn.test/pic.jpg" } }] },
+  };
+  assert.equal(await handleMessengerMessaging(env, event, planFor, fetchImpl), false);
+});

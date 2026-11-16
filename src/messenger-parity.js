@@ -75,6 +75,17 @@ import {
   getCodePhoneValid,
 } from "./getcode.js";
 import { buildQuickReplies, plainTextCard } from "./messenger.js";
+import { listRecordedVoiceIds } from "./neural-voice.js";
+import {
+  RECORDED_OVERLAY_KEY,
+  RECORDED_R2_PREFIX,
+  MAX_RECORD_BYTES,
+  RECORD_AUDIO_TIMEOUT_MS,
+  cleanMimeType,
+  recordedFileName,
+  recordPrompt,
+  mergeRecordedIds,
+} from "./record-voice.js";
 
 export const WORKER_BASE_URL = "https://coptic-dictionary-messenger-bot.abr429701.workers.dev";
 // The learn web app + privacy page stay on the Telegram Worker (see the
@@ -85,7 +96,7 @@ export const R2_MEDIA_BASE_URL = "https://pub-e39b5be260724e0ea1bbf6a7db089987.r
 
 // Quick-reply payload namespaces. "pick|<index>" belongs to the
 // dictionary core agent; these three belong to this module.
-export const MESSENGER_PARITY_PAYLOAD_PREFIXES = ["learn|", "cert|", "admin|"];
+export const MESSENGER_PARITY_PAYLOAD_PREFIXES = ["learn|", "cert|", "admin|", "record|"];
 
 export const BROADCAST_MAX_CHARS = 4000;
 export const CERT_NOT_FOUND_TEXT = "الرقم الكودي غير صحيح.";
@@ -482,12 +493,8 @@ export const ADMIN_NOT_APPLICABLE = {
   usertimeline: "الخط الزمني لتحديثات مستخدم تيليجرام — لا يوجد مقابل في ماسنجر",
   trace: "تتبع تحديث تيليجرام (update trace) — خاص بتيليجرام",
   reportclose: "إغلاق بلاغ — سير عمل البلاغات يعمل بأزرار إنلاين في تيليجرام",
-  // Voices: the recording flow is Telegram voice messages.
-  record: "تسجيل الصوت برسائل صوتية في تيليجرام — لا يوجد مقابل في ماسنجر",
-  record_choose: "اختيار كلمة للتسجيل في تيليجرام — لا يوجد مقابل في ماسنجر",
-  record_select: "اختيار كلمة للتسجيل في تيليجرام — لا يوجد مقابل في ماسنجر",
-  record_stop: "إيقاف التسجيل في تيليجرام — لا يوجد مقابل في ماسنجر",
-  record_voice: "تسجيل الصوت برسائل صوتية في تيليجرام — لا يوجد مقابل في ماسنجر",
+  // Voices: the recording flow now runs on Messenger too (/record —
+  // src/record-voice.js). The Telegram-pipeline markers stay na.
   noaudio: "علامة «بلا صوت» في خط أنابيب أصوات تيليجرام — لا يوجد مقابل في ماسنجر",
   nopronounce: "علامة «بلا نطق» في خط أنابيب أصوات تيليجرام — لا يوجد مقابل في ماسنجر",
   uploadaudio: "رفع ملف صوتي عبر تيليجرام — لا يوجد مقابل في ماسنجر",
@@ -854,6 +861,10 @@ export function createMessengerParity(deps = {}) {
     runUserCommand = null, // (cmd, arg, senderId) => plan | null — owning agent
     getDictAudit = null, // () => { duplicates, emptyMeaning, ... } | null
     deleteVoice = null, // (wordId) => boolean
+    putRecording = null, // (r2Key, bytes, contentType) => { ok, error } — R2 upload for /record
+    fetchImpl = null, // fetch for downloading the admin's audio attachment
+    searchWords = null, // (query) => [{ id, coptic, pronunciation, english, meaning }] — for /record_choose
+    nextUnrecorded = null, // (recordedIds:Set<string>) => { id, coptic, ... , recorded, total } | null — for /record
     getBroadcastControl = null, // () => { paused, speed } | null
     setBroadcastControl = null, // (patch) => boolean
     getBroadcastStats = null, // () => { sent, total, ... } | null
@@ -869,6 +880,8 @@ export function createMessengerParity(deps = {}) {
   //   { certAwaiting: "0"|"1", getcodeStep: "name"|"phone",
   //     getcodeName, examAwaiting: { formId, examUrl, lessonId },
   //     lastLessonId, lastLevelId, pendingBroadcast,
+  //     recordState: { mode: "sequential"|"chosen", id, coptic },
+  //     recordPick: true (choosing a word for /record_choose),
   //     menuList: { kind, items: [...] } }
   const memoryStates = new Map();
   const loadState = deps.loadState ?? (async (senderId) => ({ ...(memoryStates.get(String(senderId)) ?? {}) }));
@@ -919,7 +932,159 @@ export function createMessengerParity(deps = {}) {
   const clearFlows = {
     certAwaiting: undefined, getcodeStep: undefined, getcodeName: undefined,
     examAwaiting: undefined, pendingBroadcast: undefined, pendingConfirm: undefined, menuList: undefined,
+    recordState: undefined, recordPick: undefined,
   };
+
+  // -- voice recording (/record) -------------------------------------------
+  // Telegram's /record flow (final-code-fix src/index.js), adapted:
+  // the admin records a word as a Messenger voice message; the Worker
+  // downloads it and stores it in R2 recorded/<id>.<ext>, and the live
+  // DO overlay (RECORDED_OVERLAY_KEY) makes it playable before its
+  // manifest line lands. The prompt asks for the word 3× in one
+  // recording — that IS the repeat mechanism (record-voice.js).
+  // The dictionary itself lives with the owning agent: nextUnrecorded /
+  // searchWords are injected deps (index.js closes over records).
+
+  async function recordedOverlay() {
+    const raw = await safeCall(store.get, RECORDED_OVERLAY_KEY);
+    return raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+  }
+
+  async function saveRecordedOverlay(next) {
+    await safeCall(store.put, RECORDED_OVERLAY_KEY, next);
+  }
+
+  async function recordedIds() {
+    return mergeRecordedIds(listRecordedVoiceIds(), await recordedOverlay());
+  }
+
+  async function beginRecord(senderId, state) {
+    if (!nextUnrecorded) return notWiredText("اختيار كلمة للتسجيل");
+    const ids = await recordedIds();
+    const word = await safeCall(nextUnrecorded, ids);
+    if (!word) {
+      await commit(senderId, state, { recordState: undefined, recordPick: undefined });
+      return textPlan(recordPrompt(null));
+    }
+    await commit(senderId, state, {
+      ...clearFlows,
+      recordState: { mode: "sequential", id: word.id, coptic: word.coptic ?? "" },
+    });
+    return textPlan(recordPrompt(word, { recorded: word.recorded ?? ids.size, total: word.total ?? 0 }));
+  }
+
+  async function beginRecordChoose(senderId, state) {
+    await commit(senderId, state, { ...clearFlows, recordPick: true });
+    return textPlan("🔎 أرسل الكلمة التي تريد تسجيلها، وسأعرض لك اقتراحات القاموس.");
+  }
+
+  async function stopRecord(senderId, state) {
+    await commit(senderId, state, { recordState: undefined, recordPick: undefined });
+    return textPlan("⏸️ تم إيقاف جلسة التسجيل. أرسل /record لاستكمالها من أول كلمة غير مسجلة.");
+  }
+
+  async function startChosenRecording(senderId, state, item) {
+    if (!item?.id) return textPlan("⚠️ لم أجد هذه الكلمة، أعد البحث من فضلك.");
+    await commit(senderId, state, {
+      ...clearFlows,
+      recordState: { mode: "chosen", id: Number(item.id), coptic: String(item.coptic ?? item.label ?? "") },
+    });
+    return textPlan(recordPrompt({
+      coptic: String(item.coptic ?? item.label ?? ""),
+      pronunciation: item.pronunciation ?? "",
+      english: item.english ?? "",
+      meaning: item.meaning ?? "",
+    }));
+  }
+
+  async function handleRecordChooseText(senderId, state, text) {
+    if (!searchWords) return textPlan("⚠️ اختيار كلمة للتسجيل غير موصّل بعد على ماسنجر — يحتاج توصيل البحث في الربط.");
+    const candidates = (await safeCall(searchWords, text)) ?? [];
+    const list = (Array.isArray(candidates) ? candidates : []).filter((c) => c?.id != null);
+    if (!list.length) return textPlan("لم أجد كلمة بهذا البحث. جرّب بحثًا آخر:");
+    if (list.length === 1) return startChosenRecording(senderId, state, list[0]);
+    const items = list.slice(0, 15).map((c) => ({
+      type: "record-pick", id: Number(c.id), label: String(c.coptic ?? ""),
+      coptic: String(c.coptic ?? ""), pronunciation: c.pronunciation ?? "",
+      english: c.english ?? "", meaning: c.meaning ?? "",
+      payload: `record|pick:${c.id}`,
+    }));
+    const lines = ["اختر الكلمة التي تريد تسجيلها:", "أرسل رقمًا للاختيار.", "", ...items.map((it, i) => `${i + 1}. ${it.label}`)];
+    const plan = textPlan(lines.join("\n"));
+    plan.menuList = { kind: "record-choose", items };
+    await commit(senderId, state, { menuList: plan.menuList });
+    return withQuickRepliesOnLast(plan, items);
+  }
+
+  // One voice message from the admin while a record session is open.
+  // attachment: the Messenger audio attachment { type: "audio",
+  // payload: { url } }. Returns a plan, or null when the message is not
+  // a recording turn.
+  async function handleAudio(senderId, attachment) {
+    if (!isAdmin(senderId)) return emptyPlan();
+    const state = await load(senderId);
+    const rec = state.recordState;
+    if (!rec?.id) {
+      return textPlan("🎙️ لبدء التسجيل أرسل /record (أو /record_choose لاختيار كلمة).");
+    }
+    if (state.recordPick) {
+      return textPlan("🔎 اختر الكلمة أولًا من القائمة، ثم أرسل الصوت.");
+    }
+    const url = attachment?.type === "audio" ? attachment?.payload?.url : null;
+    if (!url || typeof url !== "string") {
+      return textPlan("⚠️ لم يصل أي ملف صوتي. أرسل التسجيل كرسالة صوتية.");
+    }
+    let bytes = null;
+    let contentType = "";
+    try {
+      const res = await (fetchImpl ?? globalThis.fetch)(url, { signal: AbortSignal.timeout(RECORD_AUDIO_TIMEOUT_MS) });
+      if (!res.ok) return textPlan("⚠️ تعذّر تنزيل الصوت من ماسنجر، حاول إرساله مرة أخرى.");
+      contentType = res.headers?.get?.("content-type") ?? "";
+      const buf = await res.arrayBuffer();
+      bytes = new Uint8Array(buf);
+    } catch {
+      return textPlan("⚠️ تعذّر تنزيل الصوت من ماسنجر، حاول إرساله مرة أخرى.");
+    }
+    if (!bytes || bytes.byteLength < 100) {
+      return textPlan("⚠️ الصوت فارغ أو قصير جدًا — سجّل الكلمة مرة أخرى.");
+    }
+    if (bytes.byteLength > MAX_RECORD_BYTES) {
+      return textPlan(`⚠️ الصوت كبير جدًا (الحد ${Math.round(MAX_RECORD_BYTES / 1024 / 1024)} ميجا). سجّل مقطعًا أقصر.`);
+    }
+    const filename = recordedFileName(rec.id, contentType, url);
+    if (!filename) {
+      return textPlan("⚠️ تعذّر تحديد صيغة الصوت. جرّب إرساله مرة أخرى.");
+    }
+    if (!putRecording) {
+      return textPlan("⚠️ التخزين غير موصّل بعد على ماسنجر — يحتاج ربط مخزن R2 (انظر مواصفات الربط).");
+    }
+    const saved = await safeCall(putRecording, `${RECORDED_R2_PREFIX}/${filename}`, bytes, cleanMimeType(contentType) || "audio/mp4");
+    if (!saved?.ok) {
+      return textPlan(`⚠️ تعذّر حفظ التسجيل: ${saved?.error ?? "خطأ غير معروف"}. حاول مرة أخرى.`);
+    }
+    const overlay = await recordedOverlay();
+    const had = Object.hasOwn(overlay, String(rec.id)) || listRecordedVoiceIds().includes(String(rec.id));
+    await saveRecordedOverlay({ ...overlay, [String(rec.id)]: filename });
+    const word = rec.coptic ? `«${rec.coptic}»` : "الكلمة";
+    const confirm = `✅ تم حفظ تسجيل ${word}${had ? " (استبدل التسجيل السابق)" : ""}.`;
+    if (rec.mode === "chosen") {
+      await commit(senderId, state, { recordState: undefined, recordPick: true });
+      return textPlan(`${confirm}\n🔎 أرسل كلمة أخرى للبحث عنها وتسجيلها، أو أرسل /record_stop.`);
+    }
+    // Sequential: advance to the next unrecorded word (Telegram's
+    // nextVoicePrompt). The merged set now includes the word just saved.
+    if (!nextUnrecorded) return textPlan(confirm);
+    const ids = await recordedIds();
+    const next = await safeCall(nextUnrecorded, ids);
+    if (!next) {
+      await commit(senderId, state, { recordState: undefined, recordPick: undefined });
+      return textPlan(`${confirm}\n${recordPrompt(null)}`);
+    }
+    await commit(senderId, state, {
+      recordState: { mode: "sequential", id: next.id, coptic: next.coptic ?? "" },
+    });
+    return textPlan(`${confirm}\n${recordPrompt(next, { recorded: next.recorded ?? ids.size, total: next.total ?? 0 })}`);
+  }
 
   // -- learn ---------------------------------------------------------------
 
@@ -990,7 +1155,7 @@ export function createMessengerParity(deps = {}) {
       lastLevelId: level.id,
       examAwaiting: exam ? { formId: exam.formId, examUrl: exam.examUrl, lessonId } : undefined,
       certAwaiting: undefined, getcodeStep: undefined, getcodeName: undefined,
-      pendingBroadcast: undefined,
+      pendingBroadcast: undefined, recordState: undefined, recordPick: undefined,
       menuList: { kind: "learn-nav", lessonId },
     });
     const out = { texts, voiceUrl: null, attachments };
@@ -1238,6 +1403,11 @@ export function createMessengerParity(deps = {}) {
         if (p) return p;
       }
       return textPlan("⚠️ هذا الأمر يعمل في المسار الخاص به — لم يتم توصيله بعد.");
+    }
+    if (list?.kind === "record-choose") {
+      if (!isAdmin(senderId)) return emptyPlan();
+      if (item.type === "record-pick") return startChosenRecording(senderId, state, item);
+      return textPlan("⚠️ اختيار غير معروف.");
     }
     if (list?.kind === "learn-home") return levelMenuPlan(senderId, state, item.levelId);
     if (list?.kind === "level") {
@@ -2338,6 +2508,9 @@ export function createMessengerParity(deps = {}) {
       case "advanced":
         return advancedCommand(senderId, state, cmd, arg);
       case "voices": {
+        if (cmd === "record" || cmd === "record_voice") return beginRecord(senderId, state);
+        if (cmd === "record_choose" || cmd === "record_select") return beginRecordChoose(senderId, state);
+        if (cmd === "record_stop") return stopRecord(senderId, state);
         if (cmd === "voice_delete" || cmd === "voice_delete_all" || cmd === "voice_delete_many") {
           if (cmd === "voice_delete") {
             const id = Number(String(arg ?? "").trim());
@@ -2349,8 +2522,12 @@ export function createMessengerParity(deps = {}) {
           return { __confirm: { command: cmd, arg, label: `حذف ${cmd === "voice_delete_all" ? "كل الأصوات المسجلة" : "الأصوات المطلوبة"}` } };
         }
         if (cmd === "voicecoverage") {
+          // Recorded words = baked-in manifest + live DO overlay (a
+          // fresh /record is live before its manifest line lands).
+          const ids = await recordedIds();
           const stats = getStats ? await safeCall(getStats) : null;
-          return textPlan(`🎙 تغطية الأصوات: ${stats?.voicedWords ?? "—"} كلمة لها صوت من ${Number(stats?.recordCount ?? 0).toLocaleString("en-US")}.`);
+          const total = Number(stats?.recordCount ?? 0);
+          return textPlan(`🎙 تغطية الأصوات: ${ids.size} كلمة لها صوت مسجل${total ? ` من ${total.toLocaleString("en-US")}` : ""}.`);
         }
         if (cmd === "rebuildvoice") {
           if (runTask) {
@@ -2453,6 +2630,13 @@ export function createMessengerParity(deps = {}) {
     // code. Commands and nav words fall through (a nav tap or a command
     // leaves the flow, like a menu tap in Telegram).
     if (!isCommand && !NAV_WORDS.has(norm)) {
+      // Choosing a word for /record_choose: the text is the word to
+      // search for (checked first — a record session owns the turn).
+      // A bare number is NOT a search: it picks from the shown list
+      // (handled by the bare-number branch below).
+      if (state.recordPick && !/^\d+$/u.test(folded)) {
+        return handleRecordChooseText(senderId, state, text);
+      }
       if (state.certAwaiting === "0" || state.certAwaiting === "1") {
         return handleCertCode(senderId, state, text);
       }
@@ -2637,6 +2821,18 @@ export function createMessengerParity(deps = {}) {
       if (m) return beginCertFlow(senderId, state, m[1]);
       return null;
     }
+    if (raw.startsWith("record|")) {
+      if (!isAdmin(senderId)) return emptyPlan();
+      const m = raw.match(/^record\|pick:(\d+)$/u);
+      if (m) {
+        const item = state.menuList?.kind === "record-choose"
+          ? state.menuList.items?.find((it) => String(it.id) === m[1])
+          : null;
+        if (!item) return textPlan("⚠️ انتهت قائمة الاختيار، أرسل /record_choose مرة أخرى.");
+        return startChosenRecording(senderId, state, item);
+      }
+      return null;
+    }
     // learn|...
     let m = raw.match(/^learn\|level:(m_learn_l[12])$/u);
     if (m) return levelMenuPlan(senderId, state, m[1]);
@@ -2667,7 +2863,7 @@ export function createMessengerParity(deps = {}) {
     return null;
   }
 
-  return { handleText, handlePick, isAdmin };
+  return { handleText, handlePick, handleAudio, isAdmin };
 }
 
 // Bare-number resolution against a stored menuList, exported for the

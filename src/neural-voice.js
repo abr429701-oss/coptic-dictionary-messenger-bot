@@ -12,6 +12,7 @@
 // except words whose Coptic spelling contains ϣ, which use Salli [US English].
 
 import { isSingleWordOgg, repeatSingleWordOgg } from "./ogg-repeat.js";
+import { recordedFilenameFor, resolveRecordedPlayback, recordedPlaybackUrl } from "./record-voice.js";
 export { isSingleWordOgg };
 import audioManifest from "../data/audio-manifest.json" with { type: "json" };
 import audioVersions from "../data/audio-versions.json" with { type: "json" };
@@ -345,19 +346,57 @@ export const prebuiltAudioUrl = (env, id) => {
   return audioUrl(env, id, { bust: true });
 };
 
-// Admin-recorded human voice, URL form. The recordings have NO public URL
-// today — Telegram serves them by file_id, the WhatsApp port from local
-// disk — so this tier applies only once the files are hosted and
-// RECORDED_AUDIO_BASE_URL is set (the R2 public bucket is the intended
-// host; the deploy token currently lacks R2 Edit, so nothing is hosted
-// yet). Without the base this returns null, never a dead URL: a word with
-// a recording but no host falls through to its prebuilt voice.
+// Admin-recorded human voice, URL form. The recordings are hosted on
+// the R2 public bucket under recorded/ (RECORDED_AUDIO_BASE_URL must
+// point there); without the base this returns null, never a dead URL:
+// a word with a recording but no host falls through to its prebuilt
+// voice.
 export const recordedAudioUrl = (env, id) => {
   if (id == null || !Object.hasOwn(recordedVoices, String(id))) return null;
   const base = env?.RECORDED_AUDIO_BASE_URL;
   if (!base) return null;
   return `${String(base).replace(/\/+$/u, "")}/${encodeURIComponent(recordedVoices[String(id)])}`;
 };
+
+// Baked-in recorded-voice index (data/recorded-voices.json, synced from
+// the Telegram repo): word id -> file name. The live DO overlay (a fresh
+// /record save) wins over this at playback — see
+// recordedAudioUrlWithOverlay below.
+export function listRecordedVoiceIds() {
+  return Object.keys(recordedVoices);
+}
+
+export function recordedManifestFilename(id) {
+  if (id == null || !Object.hasOwn(recordedVoices, String(id))) return null;
+  return recordedVoices[String(id)];
+}
+
+// Stored file name for a word: the live DO overlay wins over the
+// baked-in manifest (a fresh /record save is live before its manifest
+// line lands). Null when the word has no recording anywhere.
+export function recordedFilenameForId(id, overlay = {}) {
+  return recordedFilenameFor(id, recordedVoices, overlay);
+}
+
+// Overlay-aware recorded URL: the live DO overlay (record-voice.js
+// RECORDED_OVERLAY_KEY) wins over the baked-in manifest, so a fresh
+// recording plays before its manifest line lands. mp3Exists is the
+// caller's check for the .mp3 sibling (HEAD on the public URL, cached):
+// when the optional converter has produced recorded/<id>.mp3, playback
+// prefers it; without one the raw recording plays as-is (Messenger
+// plays MP4/AAC natively and OGG already plays fine on Messenger —
+// MP3 is an optional fallback, not a dependency; the prebuilt-voice
+// MP3 upload was stopped by the user on 2026-11-16). Without the base
+// this returns null, like recordedAudioUrl above.
+export function recordedAudioUrlWithOverlay(env, id, overlay = {}, { mp3Exists = false } = {}) {
+  if (id == null) return null;
+  const filename = recordedFilenameFor(id, recordedVoices, overlay);
+  if (!filename) return null;
+  const base = env?.RECORDED_AUDIO_BASE_URL;
+  if (!base) return null;
+  const playable = resolveRecordedPlayback(filename, mp3Exists);
+  return recordedPlaybackUrl(base, playable);
+}
 
 // Messenger voice resolution — Telegram's prepareWordVoice priority, URL
 // form: recorded human first, then prebuilt Polly (Miguel/Salli), then
@@ -368,6 +407,18 @@ export const recordedAudioUrl = (env, id) => {
 export const messengerVoiceUrl = (env, record) => {
   if (!record || record.id == null) return null;
   return recordedAudioUrl(env, record.id)
+    ?? prebuiltAudioUrl(env, record.id)
+    ?? (humanAudioEnabled(env) ? humanAudioUrl(env, record.id) : null);
+};
+
+// Overlay-aware form of messengerVoiceUrl: same priority, but the
+// recorded tier consults the live DO overlay and prefers the .mp3
+// sibling when the caller found one (optional — the raw recording
+// plays as-is otherwise). mp3Exists is the caller's cached HEAD
+// check — pure here so tests need no network.
+export const messengerVoiceUrlWithOverlay = (env, record, overlay = {}, { mp3Exists = false } = {}) => {
+  if (!record || record.id == null) return null;
+  return recordedAudioUrlWithOverlay(env, record.id, overlay, { mp3Exists })
     ?? prebuiltAudioUrl(env, record.id)
     ?? (humanAudioEnabled(env) ? humanAudioUrl(env, record.id) : null);
 };
