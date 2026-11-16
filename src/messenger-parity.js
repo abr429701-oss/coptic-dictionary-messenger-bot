@@ -95,13 +95,46 @@ export const CERT_ASK_TEXT = "أدخل الرقم الكودي. ";
 // Pure helpers
 // ---------------------------------------------------------------------------
 
-// Arabic-Indic (٠-٩) and Eastern Arabic-Indic (۰-۹) digits are the
-// default on Arabic keyboards: fold them to ASCII before any number is
-// parsed, or "٦" becomes a search instead of pick 6.
+// Arabic-Indic (٠-٩), Eastern Arabic-Indic (۰-۹) and fullwidth (０-９)
+// digits are the default on Arabic keyboards: fold them to ASCII before
+// any number is parsed, or "٦" becomes a search instead of pick 6 — and
+// a code typed as ١٢٣٤٥٦ must give the same result as 123456.
 export function foldDigits(value) {
   return String(value ?? "")
     .replace(/[٠-٩]/gu, (d) => String(d.charCodeAt(0) - 0x660))
-    .replace(/[۰-۹]/gu, (d) => String(d.charCodeAt(0) - 0x6f0));
+    .replace(/[۰-۹]/gu, (d) => String(d.charCodeAt(0) - 0x6f0))
+    .replace(/[０-９]/gu, (d) => String(d.charCodeAt(0) - 0xff10));
+}
+
+// Messenger has no alignment control: a line's base direction comes from
+// its first strong character, so a numbered Arabic line ("1. الأوامر…")
+// or an emoji-led line can flip to the wrong side — Arabic must sit
+// right, English left. Prefix every line of the command displays with
+// the mark matching its first strong character (RLM for Arabic, LRM for
+// Latin/Coptic/Greek) so each line renders on its own correct side.
+const RLM = "\u200F";
+const LRM = "\u200E";
+export function directLine(line) {
+  for (const ch of String(line ?? "")) {
+    const code = ch.codePointAt(0);
+    if (
+      (code >= 0x0600 && code <= 0x06ff) ||
+      (code >= 0x0750 && code <= 0x077f) ||
+      (code >= 0x08a0 && code <= 0x08ff) ||
+      (code >= 0xfb50 && code <= 0xfdff) ||
+      (code >= 0xfe70 && code <= 0xfeff)
+    ) return `${RLM}${line}`;
+    if (
+      (code >= 0x0041 && code <= 0x005a) ||
+      (code >= 0x0061 && code <= 0x007a) ||
+      (code >= 0x0370 && code <= 0x03ff) ||
+      (code >= 0x2c80 && code <= 0x2cff)
+    ) return `${LRM}${line}`;
+  }
+  return String(line ?? "");
+}
+export function directLines(text) {
+  return String(text ?? "").split("\n").map(directLine).join("\n");
 }
 
 // Get-code phone, Telegram-style (strip non-digits, need >= 4), after
@@ -116,7 +149,7 @@ export function getCodePhoneValidMsgr(phone) {
 }
 
 export function isCertCodeShape(code) {
-  return /^\d{6,10}$/u.test(String(code ?? "").trim());
+  return /^\d{6,10}$/u.test(foldDigits(String(code ?? "").trim()));
 }
 
 // The exam code check, exactly like Google's "matches" validation
@@ -282,7 +315,7 @@ export function lessonPlan(lessonId, { levels = LEARN_LEVELS, mediaUrlFor = defa
 
 export function levelsText(levels = LEARN_LEVELS, appUrl = LEARN_APP_URL) {
   const lines = [
-    "🎓 *التعلم* — اختر المستوى:",
+    "🎓 التعلم — اختر المستوى:",
     "أرسل رقمًا للاختيار، أو اضغط على المستوى.",
     "",
   ];
@@ -290,21 +323,21 @@ export function levelsText(levels = LEARN_LEVELS, appUrl = LEARN_APP_URL) {
     lines.push(`${i + 1}. ${level.title} (${level.lessons.length} درسًا)`);
   });
   lines.push("", `🌐 أو افتح تطبيق التعلم من المتصفح: ${appUrl}`);
-  return lines.join("\n");
+  return directLines(lines.join("\n"));
 }
 
 export function levelMenuText(levelId, levels = LEARN_LEVELS) {
   const level = findLevel(levelId, levels);
   if (!level) return null;
   const items = levelMenuItems(levelId, levels);
-  const lines = [`🎓 *${level.title}* — اختر:`, "أرسل رقمًا للاختيار، أو اضغط على الدرس.", ""];
+  const lines = [`🎓 ${level.title} — اختر:`, "أرسل رقمًا للاختيار، أو اضغط على الدرس.", ""];
   items.forEach((item, i) => lines.push(`${i + 1}. ${item.label}`));
-  return lines.join("\n");
+  return directLines(lines.join("\n"));
 }
 
 export function mainMenuText() {
-  return [
-    "📖 *القاموس القبطي* — القائمة",
+  return directLines([
+    "📖 القاموس القبطي — القائمة",
     "أرسل رقمًا للاختيار، أو اضغط على زر.",
     "",
     "1. 🔍 بحث — أرسل أي كلمة مباشرة",
@@ -312,7 +345,7 @@ export function mainMenuText() {
     "3. 🎓 الشهادة — الحصول على شهادة مستوى",
     "4. 🔑 الرقم الكودي — الحصول على الرقم الكودي",
     "5. ❓ مساعدة — عرض الأوامر",
-  ].join("\n");
+  ].join("\n"));
 }
 
 export const MAIN_MENU_ITEMS = [
@@ -324,7 +357,7 @@ export const MAIN_MENU_ITEMS = [
 ];
 
 export function parityWelcomeText() {
-  return [
+  return directLines([
     "📖 القاموس القبطي — ابعت أي كلمة بالقبطي أو العربي أو الإنجليزي أو الفرنسي أو الألماني، وأنا أجيب معناها ونطقها.",
     "",
     "الأوامر:",
@@ -333,19 +366,24 @@ export function parityWelcomeText() {
     "/cert — الحصول على الشهادة",
     "/getcode — الحصول على الرقم الكودي",
     "/help — المساعدة",
-  ].join("\n");
+  ].join("\n"));
 }
 
 export function parityHelpText() {
-  return [
-    "📖 *القاموس القبطي — المساعدة*",
+  return directLines([
+    "📖 القاموس القبطي — المساعدة",
     "",
-    "*البحث:* اكتب أي كلمة مباشرة: قبطي / عربي / إنجليزي / فرنسي / ألماني / يوناني.",
-    "*التعلم:* /learn — الدروس والامتحانات والشهادات • /getcode — الحصول على الرقم الكودي • /cert — الشهادة",
-    "*القائمة:* /menu — القائمة الرئيسية • /start — بدء الاستخدام",
+    "البحث: اكتب أي كلمة مباشرة: قبطي / عربي / إنجليزي / فرنسي / ألماني / يوناني.",
+    "التعلم:",
+    "/learn — الدروس والامتحانات والشهادات",
+    "/getcode — الحصول على الرقم الكودي",
+    "/cert — الشهادة",
+    "القائمة:",
+    "/menu — القائمة الرئيسية",
+    "/start — بدء الاستخدام",
     "",
     "الدروس فيديو وصور من تطبيق التعلم، والامتحانات برابط تفتحه من المتصفح بعد إدخال رقمك الكودي.",
-  ].join("\n");
+  ].join("\n"));
 }
 
 // ---------------------------------------------------------------------------
@@ -357,10 +395,17 @@ export function parityHelpText() {
 // the caption goes out as its own text message first.
 // ---------------------------------------------------------------------------
 
+// Messenger renders no markup in plain text: Telegram's <b>name</b> arrives
+// as *name* through plainTextCard, and the student must not see the name
+// between asterisks (on Telegram/WhatsApp it renders bold). Cert captions
+// carry no other emphasis, so the asterisks come off here — word cards
+// keep their *labels*.
+const stripCertEmphasis = (text) => String(text ?? "").replace(/\*([^*]+)\*/gu, "$1");
+
 export function certResultToPlan(result) {
   if (!result) return { texts: [{ text: CERT_NOT_FOUND_TEXT }], voiceUrl: null };
   if (result.kind === "photo" && result.bytes) {
-    const caption = plainTextCard(result.caption ?? "🎓 شهادتك 🎓");
+    const caption = stripCertEmphasis(plainTextCard(result.caption ?? "🎓 شهادتك 🎓"));
     return {
       texts: [{ text: caption }],
       voiceUrl: null,
@@ -373,13 +418,13 @@ export function certResultToPlan(result) {
   }
   if (result.kind === "photo" && result.url) {
     return {
-      texts: [{ text: plainTextCard(result.caption ?? "") }],
+      texts: [{ text: stripCertEmphasis(plainTextCard(result.caption ?? "")) }],
       voiceUrl: null,
       attachments: [{ type: "image", url: result.url }],
     };
   }
   if (result.kind === "text" || result.kind === "error") {
-    return { texts: [{ text: plainTextCard(result.text ?? "") }], voiceUrl: null };
+    return { texts: [{ text: stripCertEmphasis(plainTextCard(result.text ?? "")) }], voiceUrl: null };
   }
   return { texts: [{ text: CERT_NOT_FOUND_TEXT }], voiceUrl: null };
 }
@@ -652,21 +697,26 @@ function fmtDate(iso) {
 }
 
 export function adminMenuText() {
-  return [
-    "🛠 *الإدارة* — اختر القسم:",
+  return directLines([
+    "🛠 الإدارة — اختر القسم:",
     "أرسل رقمًا للاختيار، أو اضغط على القسم.",
     "",
     ...ADMIN_CATEGORIES.map((cat, i) => `${i + 1}. ${cat.title} (${cat.commands.length} أمر)`),
     "",
-    "أوامر سريعة: /stats — الإحصاءات • /users — المستخدمون • /bans — المحظورون • /broadcast — بث • /reload — تحديث البيانات",
-  ].join("\n");
+    "أوامر سريعة:",
+    "/stats — الإحصاءات",
+    "/users — المستخدمون",
+    "/bans — المحظورون",
+    "/broadcast — بث",
+    "/reload — تحديث البيانات",
+  ].join("\n"));
 }
 
 export function adminCategoryText(categoryId) {
   const cat = adminCategory(categoryId);
   if (!cat) return null;
   const lines = [
-    `📋 *${cat.title}* (${cat.commands.length} أمر)`,
+    `📋 ${cat.title} (${cat.commands.length} أمر)`,
     "أرسل رقمًا للاختيار، أو اكتب الأمر مباشرة.",
     "",
   ];
@@ -676,7 +726,7 @@ export function adminCategoryText(categoryId) {
     lines.push(`${i + 1}. /${name}${mark}`);
   });
   lines.push("", "«رجوع» للوحة الإدارة.");
-  return lines.join("\n");
+  return directLines(lines.join("\n"));
 }
 
 export function formatAdminStats(stats, uptimeMin = null) {
@@ -959,7 +1009,7 @@ export function createMessengerParity(deps = {}) {
   }
 
   async function handleCertCode(senderId, state, code) {
-    const clean = String(code ?? "").trim();
+    const clean = foldDigits(String(code ?? "").trim());
     // Bad shape never hits the Sheets (same as the WhatsApp port).
     if (!isCertCodeShape(clean)) return certResultToPlan({ kind: "not-found" });
     let result;
@@ -1012,14 +1062,15 @@ export function createMessengerParity(deps = {}) {
   // -- exams -----------------------------------------------------------------
 
   async function checkExamCode(code, formId) {
+    const folded = foldDigits(String(code ?? "").trim());
     if (examGate) {
       try {
-        return await examGate(code, formId);
+        return await examGate(folded, formId);
       } catch {
         return { allowed: false, name: null };
       }
     }
-    const clean = String(code ?? "").trim();
+    const clean = folded;
     let allowed = false;
     const baked = bakedPatternFor(formId, examForms);
     if (baked) allowed = codeMatches(baked, clean);

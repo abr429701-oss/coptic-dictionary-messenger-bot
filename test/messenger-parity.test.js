@@ -15,6 +15,8 @@ import {
   levelMenuItems,
   levelsText,
   levelMenuText,
+  parityHelpText,
+  adminMenuText,
   lessonPlan,
   findLesson,
   r2UrlFor,
@@ -23,6 +25,10 @@ import {
   examUrlFor,
   normalizeGetCodePhoneMsgr,
   getCodePhoneValidMsgr,
+  foldDigits,
+  isCertCodeShape,
+  directLine,
+  directLines,
   certResultToPlan,
   parseBanArgs,
   normalizeTargetPsid,
@@ -210,7 +216,8 @@ test("level menu lists ALL lessons on one page; quick replies cap at 13", async 
   const level = await parity.handlePick(USER_PSID, "learn|level:m_learn_l1");
   assert.ok(level);
   const lines = level.texts[0].text.split("\n");
-  assert.ok(lines.some((l) => l.startsWith("22. ")), "all 22 items are in the text list");
+  const plain = (l) => l.replace(/^[\u200E\u200F]/u, "");
+  assert.ok(lines.some((l) => plain(l).startsWith("22. ")), "all 22 items are in the text list");
   const last = lastTextWithReplies(level);
   assert.ok(last.quickReplies.length <= 13, "Meta caps quick replies at 13");
   assert.equal(last.quickReplies[0].payload, "learn|getcode");
@@ -277,13 +284,14 @@ test("lesson nav: next/prev by pick and by word, back to the level, home", async
 test("certResultToPlan maps every lookup outcome", () => {
   const bytes = new Uint8Array([1, 2, 3]);
   const ready = certResultToPlan({ kind: "photo", bytes, contentType: "image/png", fileName: "certificate.png", caption: "مبروك <b>لمياء</b>" });
-  assert.equal(ready.texts[0].text, "مبروك *لمياء*");
+  assert.equal(ready.texts[0].text, "مبروك لمياء");
   assert.equal(ready.photoBytes.bytes, bytes);
   assert.equal(ready.photoBytes.contentType, "image/png");
   const icon = certResultToPlan({ kind: "photo", url: "https://example.test/icon.png", caption: "يجب حل <b>الامتحان النهائي</b>" });
   assert.equal(icon.attachments[0].type, "image");
   assert.equal(icon.attachments[0].url, "https://example.test/icon.png");
-  assert.match(icon.texts[0].text, /يجب حل \*الامتحان النهائي\*/u);
+  assert.match(icon.texts[0].text, /يجب حل الامتحان النهائي/u);
+  assert.doesNotMatch(icon.texts[0].text, /\*/u, "no asterisks anywhere in a cert caption on Messenger");
   assert.equal(certResultToPlan({ kind: "text", text: "نص" }).texts[0].text, "نص");
   assert.equal(certResultToPlan({ kind: "not-found" }).texts[0].text, "الرقم الكودي غير صحيح.");
   assert.equal(certResultToPlan({ kind: "error", text: "خطأ" }).texts[0].text, "خطأ");
@@ -333,6 +341,38 @@ test("cert flow: bad code shape never hits the Sheets; /cert picker asks the lev
   assert.deepEqual(last.quickReplies.map((q) => q.payload), ["cert|level:1", "cert|level:2"]);
   const picked = await parity.handlePick(USER_PSID, "cert|level:2");
   assert.equal(picked.texts[0].text, "أدخل الرقم الكودي. ");
+});
+
+test("Arabic-Indic digits give the same result as Western digits (cert code, get-code phone)", async () => {
+  const parity = makeParity({
+    certLookup: async (code) => (code === "5307205" ? { kind: "text", text: "وجدتها" } : { kind: "not-found" }),
+  });
+  await parity.handleText(USER_PSID, "/cert1");
+  const western = await parity.handleText(USER_PSID, "5307205");
+  const eastern = await parity.handleText(USER_PSID, "٥٣٠٧٢٠٥");
+  assert.deepEqual(eastern, western, "٥٣٠٧٢٠٥ must behave exactly like 5307205");
+  assert.equal(western.texts[0].text, "وجدتها");
+  assert.equal(isCertCodeShape("٥٣٠٧٢٠٥"), true, "the shape check folds digits too");
+  assert.equal(isCertCodeShape("5307205"), true);
+  assert.equal(foldDigits("١٢٣٤٥٦"), "123456");
+  assert.equal(foldDigits("۱۲۳۴۵۶"), "123456");
+  assert.equal(foldDigits("１２３４５６"), "123456");
+  assert.equal(normalizeGetCodePhoneMsgr("٠١٢٠٧٨٢٩٣٨٨"), "01207829388");
+  assert.equal(getCodePhoneValidMsgr("٠١٢٠٧٨٢٩٣٨٨"), true);
+});
+
+test("command displays: Arabic lines sit right (RLM), English/command lines sit left (LRM), no asterisks", () => {
+  assert.equal(directLine("الأوامر:"), "\u200Fالأوامر:");
+  assert.equal(directLine("/learn — الدروس"), "\u200E/learn — الدروس");
+  assert.equal(directLine("1. الأوامر الأساسية (16 أمر)"), "\u200F1. الأوامر الأساسية (16 أمر)");
+  assert.equal(directLine("1. /start"), "\u200E1. /start");
+  assert.equal(directLine(""), "");
+  const help = parityHelpText();
+  assert.doesNotMatch(help, /\*/u, "help carries no asterisks");
+  assert.ok(help.split("\n").some((l) => l === "\u200E/learn — الدروس والامتحانات والشهادات"), "one command per line, LTR");
+  const admin = adminMenuText();
+  assert.doesNotMatch(admin, /\*/u, "admin menu carries no asterisks");
+  assert.ok(admin.split("\n").some((l) => l === "\u200E/stats — الإحصاءات"), "quick commands one per line, in order");
 });
 
 // ---------------------------------------------------------------------------

@@ -13,29 +13,31 @@
 // Rules carried over from the WhatsApp port (hard-won, do not re-litigate):
 // - Quick replies are a supplement only: the full text list is always sent.
 // - Text goes first, voice second, as two separate messages: an audio
-//   message cannot carry the word card. The voice goes out 3× with 700ms
-//   gaps (Telegram's rule), the repeats reusing Meta's attachment_id.
+//   message cannot carry the word card. The voice goes out ONCE, as one
+//   OGG with the word repeated 3× inside (700ms gaps — Telegram's rule,
+//   via ogg-repeat.js); the user hears 3 separate voice messages as a bug,
+//   so the transport never sends the voice more than once per turn.
 // - A list's quick replies live on the Page's LATEST message, so the list
 //   (with its quick replies) is always the last message of its turn:
 //   nothing is ever sent after a list in the same turn.
 // - Secrets (App Secret, Page Token, verify token) are never logged.
 
+import { repeatSingleWordOgg } from "./ogg-repeat.js";
+
 export const MESSENGER_SEND_URL = "https://graph.facebook.com/v21.0/me/messages";
 export const MESSENGER_PICK_PREFIX = "pick|";
 export const MESSENGER_QUICK_REPLY_MAX = 13; // Meta's limit per message
 export const MESSENGER_QUICK_REPLY_TITLE_MAX = 20; // Meta's limit, in characters
-// Telegram plays the word 3× with 700ms gaps (one repeated OGG); Messenger
-// has no in-message repeat, so the audio message itself goes out 3×.
+// Telegram plays the word 3× with 700ms gaps inside ONE repeated OGG;
+// Messenger does the same: the voice file is fetched, repeated into one
+// OGG and uploaded once. The repeats below are the repeats INSIDE that
+// one file — the transport sends exactly one audio message per turn.
 export const MESSENGER_VOICE_REPEATS = 3;
 export const MESSENGER_VOICE_REPEAT_GAP_MS = 700;
 // A send slower than this gets ONE warn line (diagnosis, not noise): the
 // user reports the voice arriving very late, and a slow audio send is
 // Meta fetching the file from GitHub raw on every send.
 export const MESSENGER_SLOW_SEND_MS = 3000;
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
 
 // -----------------------------------------------------------------------------
 // Signature verification (X-Hub-Signature-256)
@@ -90,11 +92,12 @@ export async function verifyMessengerSignature(rawBody, signatureHeader, appSecr
 // -----------------------------------------------------------------------------
 
 // The Telegram word card is HTML (<b>Label:</b> value). Messenger takes
-// plain text; bold becomes WhatsApp-style *bold*, the only markup Messenger
-// renders as emphasis in plain text.
+// plain text and renders NO markup: a * would show literally around the
+// word, so bold is dropped entirely — labels stay plain, no asterisks
+// anywhere in the output.
 export function plainTextCard(html) {
   return String(html ?? "")
-    .replace(/<b>(.*?)<\/b>/gu, "*$1*")
+    .replace(/<b>(.*?)<\/b>/gu, "$1")
     .replace(/<[^>]*>/gu, "")
     .replaceAll("&amp;", "&")
     .replaceAll("&lt;", "<")
@@ -153,17 +156,6 @@ export function messengerAttachmentMessage(type, url) {
     attachment: {
       type: safeType,
       payload: { url: String(url), is_reusable: true },
-    },
-  };
-}
-
-// Audio by Meta's reusable attachment id (returned when a send used
-// is_reusable): sending by id never makes Meta re-fetch the file.
-export function messengerAudioIdMessage(attachmentId) {
-  return {
-    attachment: {
-      type: "audio",
-      payload: { attachment_id: String(attachmentId) },
     },
   };
 }
@@ -307,6 +299,81 @@ export async function sendMessengerPhotoBytes(env, recipientId, photoBytes, fetc
   return { ok: true, messageId: result.message_id, recipientId: result.recipient_id ?? String(recipientId) };
 }
 
+// Multipart audio upload (a word voice arrives as bytes, not a URL — the
+// repeated OGG is built in this Worker): the same shape as the photo
+// upload, with an audio attachment and the bytes as `filedata`. Meta
+// answers the same { message_id } shape. Returns { ok, messageId }.
+export async function sendMessengerAudioBytes(env, recipientId, audio, fetchImpl = globalThis.fetch) {
+  const token = env?.MESSENGER_PAGE_TOKEN;
+  if (!token) return { ok: false, error: "missing-page-token" };
+  const bytes = audio?.bytes;
+  if (!bytes || (typeof bytes === "object" && "byteLength" in bytes && bytes.byteLength === 0)) {
+    return { ok: false, error: "missing-bytes" };
+  }
+  const form = new FormData();
+  form.append("recipient", JSON.stringify({ id: String(recipientId) }));
+  form.append("message", JSON.stringify({ attachment: { type: "audio", payload: {} } }));
+  form.append(
+    "filedata",
+    new Blob([bytes], { type: audio.contentType || "audio/ogg" }),
+    audio.fileName || "voice.ogg",
+  );
+  let response;
+  const started = Date.now();
+  try {
+    response = await fetchImpl(MESSENGER_SEND_URL, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}` },
+      body: form,
+    });
+  } catch (error) {
+    console.error("Messenger audio send failed (network)", error instanceof Error ? error.message : "unknown");
+    return { ok: false, error: "network" };
+  }
+  let result = null;
+  try {
+    result = await response.json();
+  } catch {
+    /* Meta answers JSON; a non-JSON body is a failure */
+  }
+  if (!response.ok || !result?.message_id) {
+    console.error("Messenger audio send failed", response.status, result?.error?.message ?? "unknown");
+    return { ok: false, error: result?.error?.message ?? `http-${response.status}` };
+  }
+  const elapsedMs = Date.now() - started;
+  if (elapsedMs > MESSENGER_SLOW_SEND_MS) {
+    console.warn(`Messenger slow send (${elapsedMs}ms, audio-upload)`);
+  }
+  return { ok: true, messageId: result.message_id, recipientId: result.recipient_id ?? String(recipientId) };
+}
+
+// One voice message with the word repeated inside it (Telegram's rule):
+// fetch the single-word OGG, repeat it MESSENGER_VOICE_REPEATS times with
+// MESSENGER_VOICE_REPEAT_GAP_MS gaps into one OGG stream, and upload that
+// once. Prebuilt files carry the "once-v1" marker; recordings do not, so
+// the repeat is retried without the marker requirement. Anything that is
+// not a repeatable OGG (fetch failed, not OGG, unparseable) falls back to
+// ONE send of the original URL — the word once, never three messages.
+export async function sendWordVoice(env, senderId, voiceUrl, fetchImpl = globalThis.fetch) {
+  const fallback = () => sendMessengerMessage(env, senderId, messengerAudioMessage(voiceUrl), fetchImpl);
+  try {
+    const response = await fetchImpl(voiceUrl, { signal: AbortSignal.timeout(10000) });
+    if (!response.ok) return fallback();
+    const bytes = await response.arrayBuffer();
+    if (!bytes || bytes.byteLength < 4) return fallback();
+    if (new TextDecoder().decode(new Uint8Array(bytes, 0, 4)) !== "OggS") return fallback();
+    let repeated = repeatSingleWordOgg(bytes, { times: MESSENGER_VOICE_REPEATS, pauseMs: MESSENGER_VOICE_REPEAT_GAP_MS, requireMarker: true });
+    if (repeated === bytes) {
+      repeated = repeatSingleWordOgg(bytes, { times: MESSENGER_VOICE_REPEATS, pauseMs: MESSENGER_VOICE_REPEAT_GAP_MS, requireMarker: false });
+    }
+    const payload = repeated !== bytes ? repeated : bytes;
+    const uploaded = await sendMessengerAudioBytes(env, senderId, { bytes: payload, contentType: "audio/ogg", fileName: "voice.ogg" }, fetchImpl);
+    return uploaded.ok ? uploaded : fallback();
+  } catch {
+    return fallback();
+  }
+}
+
 // -----------------------------------------------------------------------------
 // Event handling
 // -----------------------------------------------------------------------------
@@ -322,13 +389,11 @@ export async function sendMessengerPhotoBytes(env, recipientId, photoBytes, fetc
 // transport never invents a task.
 // Send order per plan: typing_on first (the user sees "يكتب..." while the
 // plan is computed), then attachments (lesson media by URL), then a
-// photo upload, then the texts in order, then the voice attachment, sent
-// MESSENGER_VOICE_REPEATS times with MESSENGER_VOICE_REPEAT_GAP_MS gaps
-// (text before voice — the WhatsApp port's proven order; the 3× repeat is
-// Telegram's rule, where one repeated OGG plays 3×). The first voice send
-// is by URL; when Meta returns a reusable attachment_id for it, the
-// repeats send by id so Meta does not re-fetch the file from GitHub twice
-// more. A failed voice send never blocks the remaining repeats. The last
+// photo upload, then the texts in order, then the voice — exactly one
+// audio message, the word repeated 3× inside one OGG (text before voice,
+// the WhatsApp port's proven order; the 3× repeat is Telegram's rule,
+// where one repeated OGG plays 3×). A failed voice send never blocks
+// anything else. The last
 // text carries the quick replies, and nothing is ever sent after it in the
 // same turn — except the voice, so a plan must not combine quick replies
 // with a voice (no current plan does: word cards carry no replies, menus
@@ -379,18 +444,8 @@ export async function handleMessengerMessaging(env, event, planFor, fetchImpl = 
     if (result.ok) sent = true;
   }
   if (plan.voiceUrl) {
-    let attachmentId = null;
-    for (let attempt = 0; attempt < MESSENGER_VOICE_REPEATS; attempt += 1) {
-      if (attempt > 0) await sleep(MESSENGER_VOICE_REPEAT_GAP_MS);
-      const audioMessage = attachmentId
-        ? messengerAudioIdMessage(attachmentId)
-        : messengerAudioMessage(plan.voiceUrl);
-      const result = await sendMessengerMessage(env, senderId, audioMessage, fetchImpl);
-      if (result.ok) {
-        sent = true;
-        if (result.attachmentId) attachmentId = result.attachmentId;
-      }
-    }
+    const result = await sendWordVoice(env, senderId, plan.voiceUrl, fetchImpl);
+    if (result.ok) sent = true;
   }
   if (plan.task && typeof planFor.executeTask === "function") {
     try {

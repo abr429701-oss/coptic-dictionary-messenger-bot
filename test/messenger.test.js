@@ -17,9 +17,9 @@ import {
   handleMessengerMessaging,
   MESSENGER_PICK_PREFIX,
   MESSENGER_SEND_URL,
-  MESSENGER_VOICE_REPEATS,
 } from "../src/messenger.js";
 import { prebuiltAudioUrl, messengerVoiceUrl, recordedAudioUrl, humanAudioUrl } from "../src/neural-voice.js";
+import { oggCrc, parseOggPages } from "../src/ogg-repeat.js";
 import records from "../data/dictionary.json" with { type: "json" };
 import audioManifest from "../data/audio-manifest.json" with { type: "json" };
 import audioVersions from "../data/audio-versions.json" with { type: "json" };
@@ -35,6 +35,73 @@ const env = {
 const SENDER_ID = "987654321";
 const PAGE_ID = "61596442358492";
 const AUDIO_BASE = "https://raw.githubusercontent.com/abr429701-oss/coptic-dictionary-bot/audio";
+
+// Minimal single-word Opus OGG fixture: OpusHead (mono) + OpusTags
+// carrying the "once-v1" marker + two audio pages of silent 20ms packets
+// (960 samples each, 3840 per copy). The worker repeats it 3× with 700ms
+// gaps into one file: head + tags + 3x2 audio pages + 2 gap pages (35
+// packets each) = 10 pages, final granule 3*3840 + 2*(35*960) = 78720.
+const OGG_SERIAL = 0x12345678;
+const SILENT_PACKET = new Uint8Array([0xf8, 0xff, 0xfe]); // 20ms Opus silence
+function oggFixturePage({ type, granule, sequence, segments }) {
+  const lacing = new Uint8Array(segments.map((s) => s.length));
+  const dataLength = segments.reduce((n, s) => n + s.length, 0);
+  const data = new Uint8Array(dataLength);
+  let at = 0;
+  for (const s of segments) { data.set(s, at); at += s.length; }
+  const out = new Uint8Array(27 + lacing.length + data.length);
+  const view = new DataView(out.buffer);
+  out.set([0x4f, 0x67, 0x67, 0x53, 0, type], 0);
+  view.setUint32(6, granule % 4294967296, true);
+  view.setUint32(10, Math.floor(granule / 4294967296), true);
+  view.setUint32(14, OGG_SERIAL, true);
+  view.setUint32(18, sequence, true);
+  out[26] = lacing.length;
+  out.set(lacing, 27);
+  out.set(data, 27 + lacing.length);
+  view.setUint32(22, oggCrc(out), true);
+  return out;
+}
+function buildVoiceFixture() {
+  const head = new Uint8Array(19);
+  head.set([0x4f, 0x70, 0x75, 0x73, 0x48, 0x65, 0x61, 0x64, 1, 1], 0); // "OpusHead", v1, mono
+  new DataView(head.buffer).setUint32(12, 48000, true);
+  const vendor = new TextEncoder().encode("once-v1");
+  const tags = new Uint8Array(8 + 4 + vendor.length + 4);
+  tags.set([0x4f, 0x70, 0x75, 0x73, 0x54, 0x61, 0x67, 0x73], 0); // "OpusTags"
+  new DataView(tags.buffer).setUint32(8, vendor.length, true);
+  tags.set(vendor, 12);
+  const pages = [
+    oggFixturePage({ type: 2, granule: 0, sequence: 0, segments: [head] }),
+    oggFixturePage({ type: 0, granule: 0, sequence: 1, segments: [tags] }),
+    oggFixturePage({ type: 0, granule: 1920, sequence: 2, segments: [SILENT_PACKET, SILENT_PACKET] }),
+    oggFixturePage({ type: 4, granule: 3840, sequence: 3, segments: [SILENT_PACKET, SILENT_PACKET] }),
+  ];
+  const total = pages.reduce((n, p) => n + p.length, 0);
+  const out = new Uint8Array(total);
+  let at = 0;
+  for (const p of pages) { out.set(p, at); at += p.length; }
+  return out;
+}
+const VOICE_FIXTURE = buildVoiceFixture();
+const VOICE_REPEATED_PAGE_COUNT = 10;
+const VOICE_REPEATED_FINAL_GRANULE = 78720;
+
+// The voice upload is one multipart message carrying the repeated OGG:
+// assert it is exactly one audio upload, and that its bytes are the word
+// repeated 3× inside one OGG stream.
+async function assertSingleRepeatedVoice(call) {
+  assert.ok(call.form instanceof FormData, "voice must go out as one multipart upload, not JSON sends");
+  assert.equal(JSON.parse(call.form.get("message")).attachment.type, "audio");
+  assert.equal(JSON.parse(call.form.get("recipient")).id, SENDER_ID);
+  const blob = call.form.get("filedata");
+  assert.equal(blob.name, "voice.ogg");
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  const pages = parseOggPages(bytes);
+  assert.equal(pages.length, VOICE_REPEATED_PAGE_COUNT, "one file: head + tags + 3x2 audio + 2 gaps");
+  assert.equal(pages[pages.length - 1].granule, VOICE_REPEATED_FINAL_GRANULE);
+  return pages;
+}
 
 const sign = (rawBody) => `sha256=${createHmac("sha256", APP_SECRET).update(rawBody).digest("hex")}`;
 
@@ -143,10 +210,19 @@ const foldArabic = (value) => String(value ?? "")
 function stubMessengerApi(calls) {
   const realFetch = globalThis.fetch;
   globalThis.fetch = async (url, options = {}) => {
+    const urlStr = String(url);
+    // The voice file fetch: the worker downloads the single-word OGG to
+    // repeat it into one file — answer with the fixture OGG.
+    if (urlStr.startsWith(AUDIO_BASE)) {
+      return new Response(VOICE_FIXTURE, { status: 200, headers: { "content-type": "audio/ogg" } });
+    }
+    const body = options?.body;
+    const isForm = typeof FormData !== "undefined" && body instanceof FormData;
     calls.push({
-      url: String(url),
+      url: urlStr,
       headers: options?.headers ?? {},
-      payload: options?.body ? JSON.parse(options.body) : null,
+      payload: isForm ? null : (body ? JSON.parse(body) : null),
+      form: isForm ? body : null,
     });
     return Response.json({ recipient_id: SENDER_ID, message_id: "mid.test-1" });
   };
@@ -264,39 +340,32 @@ test("messenger POST ignores echoes and delivery receipts", async () => {
   }
 });
 
-test("messenger search round-trip: one exact match sends the card text then the voice 3 times", async () => {
+test("messenger search round-trip: one exact match sends the card text then one voice with the word repeated 3 times inside", async () => {
   assert.ok(SINGLE, "expected a single-candidate voiced word in the dictionary");
   const calls = [];
   const restore = stubMessengerApi(calls);
   try {
     const response = await postSigned(messageEvent({ text: SINGLE.query }));
     assert.equal(response.status, 200);
-    // typing_on first, then the card text, then the voice 3 times.
-    assert.equal(calls.length, 2 + MESSENGER_VOICE_REPEATS, `expected typing + text + ${MESSENGER_VOICE_REPEATS} audio, got ${JSON.stringify(calls.map((c) => c.payload?.message ?? c.payload?.sender_action))}`);
-    const [typingCall, textCall, ...audioCalls] = calls;
+    // typing_on first, then the card text, then ONE voice upload: the
+    // word repeated 3× inside a single OGG, never 3 voice messages.
+    assert.equal(calls.length, 3, `expected typing + text + 1 audio upload, got ${JSON.stringify(calls.map((c) => c.payload?.message ?? c.payload?.sender_action ?? "upload"))}`);
+    const [typingCall, textCall, voiceCall] = calls;
     assert.equal(typingCall.payload.sender_action, "typing_on", "the user must see 'typing...' while the card is computed");
     assert.equal(typingCall.payload.message, undefined, "a sender action carries no message");
-    assert.equal(audioCalls.length, MESSENGER_VOICE_REPEATS);
-    for (const call of calls) {
+    for (const call of [typingCall, textCall]) {
       assert.equal(call.url, MESSENGER_SEND_URL);
       assert.equal(call.headers.authorization, `Bearer ${PAGE_TOKEN}`);
       assert.equal(call.payload.recipient.id, SENDER_ID);
       assert.equal(call.payload.messaging_type, "RESPONSE");
     }
-    assert.match(textCall.payload.message.text, /\*Word:\*/u);
+    assert.match(textCall.payload.message.text, /Word:/u);
+    assert.doesNotMatch(textCall.payload.message.text, /\*/u, "no asterisks anywhere in a Messenger card");
     assert.ok(textCall.payload.message.text.includes(String(SINGLE.record.coptic)), "card must carry the Coptic headword");
     assert.doesNotMatch(textCall.payload.message.text, /<b>|<\/b>/u);
-    for (const audioCall of audioCalls) {
-      assert.equal(audioCall.payload.message.attachment.type, "audio");
-      const audioUrl = audioCall.payload.message.attachment.payload.url;
-      assert.ok(audioUrl.startsWith(`${AUDIO_BASE}/`), audioUrl);
-      assert.ok(audioUrl.includes(`?v=${audioVersions[String(SINGLE.record.id)]}`), audioUrl);
-      assert.equal(audioCall.payload.message.attachment.payload.is_reusable, true, "is_reusable must be sent so Meta caches the file");
-      assert.equal(
-        decodeURIComponent(audioUrl.slice(AUDIO_BASE.length + 1).split("?v=")[0]),
-        audioManifest[String(SINGLE.record.id)],
-      );
-    }
+    assert.equal(voiceCall.url, MESSENGER_SEND_URL);
+    assert.equal(voiceCall.headers.authorization, `Bearer ${PAGE_TOKEN}`);
+    await assertSingleRepeatedVoice(voiceCall);
   } finally {
     restore();
   }
@@ -364,7 +433,7 @@ test("messenger no-result search offers did-you-mean suggestions", async () => {
   }
 });
 
-test("messenger quick-reply pick sends the full word card and the voice 3 times", async () => {
+test("messenger quick-reply pick sends the full word card and one voice with the word repeated 3 times inside", async () => {
   const suggestion = suggestSimilar("أشكرك", 3)[0];
   assert.ok(suggestion);
   const record = records[suggestion.index];
@@ -377,17 +446,13 @@ test("messenger quick-reply pick sends the full word card and the voice 3 times"
       quick_reply: { payload: `${MESSENGER_PICK_PREFIX}${suggestion.index}` },
     }));
     assert.equal(response.status, 200);
-    assert.equal(calls.length, 2 + MESSENGER_VOICE_REPEATS, "typing_on + text + 3 audio sends");
+    assert.equal(calls.length, 3, "typing_on + text + 1 audio upload");
     assert.equal(calls[0].payload.sender_action, "typing_on");
     const text = calls[1].payload.message.text;
     assert.ok(text.includes(String(record.coptic)), "card must carry the Coptic headword");
     assert.ok(text.includes(suggestion.label), "card must carry the picked word's meaning");
     assert.doesNotMatch(text, /<b>|<\/b>/u);
-    for (const audioCall of calls.slice(2)) {
-      assert.equal(audioCall.payload.message.attachment.type, "audio");
-      assert.equal(audioCall.payload.message.attachment.payload.url, prebuiltAudioUrl(env, record.id));
-      assert.equal(audioCall.payload.message.attachment.payload.is_reusable, true);
-    }
+    await assertSingleRepeatedVoice(calls[2]);
   } finally {
     restore();
   }
@@ -399,16 +464,13 @@ test("messenger exact match among many candidates sends the card directly, not t
   assert.equal(localDictionaryCandidates("ⲁⲑⲙⲟϣⲓ", 10).exactCount, 1);
   assert.equal(localDictionaryCandidates("ⲁⲑⲙⲟϣⲓ", 10).candidates.length, 10);
   const calls = await sendMessengerText("ⲁⲑⲙⲟϣⲓ");
-  assert.equal(calls.length, 2 + MESSENGER_VOICE_REPEATS, "typing_on + card text + voice 3 times");
+  assert.equal(calls.length, 3, "typing_on + card text + 1 audio upload");
   assert.equal(calls[0].payload.sender_action, "typing_on");
   const text = calls[1].payload.message.text;
   assert.ok(text.includes("ⲁⲑⲙⲟϣⲓ"), "card must carry the exact word");
   assert.doesNotMatch(text, /^اختر من الاقتراحات التالية:/u, "must not be the suggestions list");
   assert.ok(!calls[1].payload.message.quick_replies, "a card carries no quick replies");
-  const record = records.find((r) => r.coptic === "ⲁⲑⲙⲟϣⲓ");
-  for (const audioCall of calls.slice(2)) {
-    assert.equal(audioCall.payload.message.attachment.payload.url, prebuiltAudioUrl(env, record.id));
-  }
+  await assertSingleRepeatedVoice(calls[2]);
 });
 
 test("messenger same-spelling exact matches in several rows open the card", async () => {
@@ -557,34 +619,22 @@ test("messenger stale list state: expired list falls back, pre-paging list asks 
   assert.equal(none[1].payload.message.text, "انتهت هذه القائمة، ابحث عن الكلمة مرة أخرى.");
 });
 
-test("messenger voice repeats reuse Meta's attachment id instead of re-fetching the URL", async () => {
+test("messenger voice is one upload with the word repeated 3 times inside, never 3 sends", async () => {
   assert.ok(SINGLE, "expected a single-candidate voiced word in the dictionary");
   const calls = [];
-  const realFetch = globalThis.fetch;
-  globalThis.fetch = async (url, options = {}) => {
-    const payload = options?.body ? JSON.parse(options.body) : null;
-    calls.push({ url: String(url), payload });
-    const isAudio = payload?.message?.attachment?.type === "audio";
-    return Response.json({
-      recipient_id: SENDER_ID,
-      message_id: "mid.test-1",
-      ...(isAudio ? { attachment_id: "att-test-1" } : {}),
-    });
-  };
+  const restore = stubMessengerApi(calls);
   try {
     const response = await postSigned(messageEvent({ text: SINGLE.query }));
     assert.equal(response.status, 200);
-    assert.equal(calls.length, 2 + MESSENGER_VOICE_REPEATS);
+    assert.equal(calls.length, 3, "typing_on + card text + exactly one audio upload");
     assert.equal(calls[0].payload.sender_action, "typing_on");
-    const [first, second, third] = calls.slice(2);
-    assert.equal(first.payload.message.attachment.payload.url, prebuiltAudioUrl(env, SINGLE.record.id));
-    assert.equal(first.payload.message.attachment.payload.is_reusable, true);
-    for (const repeat of [second, third]) {
-      assert.equal(repeat.payload.message.attachment.payload.attachment_id, "att-test-1");
-      assert.equal(repeat.payload.message.attachment.payload.url, undefined, "repeats must not re-send the URL");
-    }
+    // No second or third audio send exists at all: the user hears one
+    // voice message with the word 3× inside it.
+    const pages = await assertSingleRepeatedVoice(calls[2]);
+    const audioPages = pages.filter((p) => p.data.length === 6);
+    assert.equal(audioPages.length, 6, "3 copies x 2 audio pages of the word");
   } finally {
-    globalThis.fetch = realFetch;
+    restore();
   }
 });
 
@@ -759,10 +809,10 @@ test("prebuiltAudioUrl returns the manifest file with ?v=, and null without a ma
   assert.equal(prebuiltAudioUrl(env, null), null);
 });
 
-test("plainTextCard strips HTML and keeps *bold* labels", () => {
+test("plainTextCard strips HTML and drops bold (no asterisks on Messenger)", () => {
   assert.equal(
     plainTextCard("<b>الكلمة:</b> ⲁⲑⲙⲟϣⲓ\n<b>المعنى:</b> x &amp; y"),
-    "*الكلمة:* ⲁⲑⲙⲟϣⲓ\n*المعنى:* x & y",
+    "الكلمة: ⲁⲑⲙⲟϣⲓ\nالمعنى: x & y",
   );
   assert.equal(plainTextCard(""), "");
 });
@@ -905,7 +955,8 @@ test("wiring: /learn returns the levels menu with quick replies (parity wired)",
   assert.ok(calls.length >= 2, "typing_on + one text should be sent");
   assert.equal(calls[0].payload.sender_action, "typing_on");
   const body = calls[1].payload.message.text;
-  assert.match(body, /🎓 \*التعلم\* — اختر المستوى:/u);
+  assert.match(body, /🎓 التعلم — اختر المستوى:/u);
+  assert.doesNotMatch(body, /\*/u, "no asterisks anywhere in a Messenger menu");
   assert.match(body, /1\. .*\(17 درسًا\)/u, "level 1 lists 17 lessons");
   assert.match(body, /2\. .*\(10 درسًا\)/u, "level 2 lists 10 lessons");
   assert.ok(Array.isArray(calls[1].payload.message.quick_replies), "quick replies on the last text");
@@ -927,7 +978,7 @@ test("wiring: bare number routes to the most recent list — dictionary list bea
   await sendMessengerText("/learn", { envOverride: kvEnv });
   await sendMessengerText("نور", { envOverride: kvEnv });
   const calls = await sendMessengerText("1", { envOverride: kvEnv });
-  const texts = calls.map((c) => c.payload.message?.text ?? "").join("\n");
+  const texts = calls.map((c) => c.payload?.message?.text ?? "").join("\n");
   assert.match(texts, /المعنى/u, "number 1 picks the first dictionary word, not lesson 1");
 });
 
@@ -937,7 +988,7 @@ test("wiring: bare number routes to the parity menu when the menu is newest", as
   await sendMessengerText("نور", { envOverride: kvEnv });
   await sendMessengerText("/learn", { envOverride: kvEnv });
   const calls = await sendMessengerText("1", { envOverride: kvEnv });
-  const texts = calls.map((c) => c.payload.message?.text ?? "").join("\n");
+  const texts = calls.map((c) => c.payload?.message?.text ?? "").join("\n");
   assert.match(texts, /درس/u, "number 1 opens the first level's lessons");
 });
 
@@ -1040,7 +1091,7 @@ test("wiring: /cancel while waiting for the name does not clear the gate; /menu 
   // /menu is a command: it works while waiting (Telegram: commands
   // keep working) and the gate stays.
   let calls = await sendMessengerText("/menu", { envOverride: kvEnv });
-  assert.match(calls.at(-1).payload.message.text, /القاموس القبطي\* — القائمة/u);
+  assert.match(calls.at(-1).payload.message.text, /القاموس القبطي — القائمة/u);
   // /cancel while waiting: Telegram's fallback text, gate stays.
   calls = await sendMessengerText("/cancel", { envOverride: kvEnv });
   assert.equal(calls.at(-1).payload.message.text, "اكتب الكلمة مباشرة للبحث أو استخدم /start للبدء.");
