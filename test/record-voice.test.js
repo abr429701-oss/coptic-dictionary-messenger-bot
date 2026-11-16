@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import {
   RECORDED_R2_PREFIX,
   RECORDED_OVERLAY_KEY,
+  RECORDED_DELETED,
   MAX_RECORD_BYTES,
   RECORD_AUDIO_TIMEOUT_MS,
   cleanMimeType,
@@ -15,6 +16,8 @@ import {
   recordPrompt,
   mergeRecordedIds,
   recordedFilenameFor,
+  applyVoiceDelete,
+  voiceDeleteR2Keys,
   mp3Sibling,
   recordedPlaybackUrl,
   resolveRecordedPlayback,
@@ -121,4 +124,56 @@ test("record-voice: storage constants", () => {
   assert.equal(RECORDED_OVERLAY_KEY, "recorded:overlay");
   assert.equal(MAX_RECORD_BYTES, 10 * 1024 * 1024);
   assert.equal(RECORD_AUDIO_TIMEOUT_MS, 15000);
+});
+
+test("record-voice: /voice_delete tombstone — a deleted manifest id falls back, never to a dead URL", () => {
+  const manifest = { 55: "55.ogg", 25344: "25344.ogg" };
+  // A tombstoned overlay entry beats the manifest: no recorded file plays.
+  const tombstoned = { 55: RECORDED_DELETED };
+  assert.equal(recordedFilenameFor(55, manifest, tombstoned), null, "tombstone hides the manifest file");
+  assert.equal(recordedFilenameFor(25344, manifest, tombstoned), "25344.ogg", "other manifest ids are untouched");
+  assert.equal(recordedFilenameFor(55, manifest, {}), "55.ogg", "without the tombstone the manifest file plays");
+  // The tombstoned id no longer counts as recorded: /record offers it
+  // again and /voicecoverage stops counting it.
+  assert.deepEqual([...mergeRecordedIds(manifest, tombstoned)].sort(), ["25344"]);
+  assert.deepEqual([...mergeRecordedIds(manifest, { 55: "55.mp4" })].sort(), ["25344", "55"], "a re-record (real filename) counts again");
+});
+
+test("record-voice: applyVoiceDelete plans the overlay change", () => {
+  // Overlay-only id (the 25318 case: R2 file deleted, manifest never
+  // had it): the key is simply removed.
+  const overlayOnly = applyVoiceDelete({ 25318: "25318.mp4", 155: "155.mp4" }, 25318, null);
+  assert.equal(overlayOnly.hadRecording, true);
+  assert.equal(overlayOnly.filename, "25318.mp4");
+  assert.equal(overlayOnly.inManifest, false);
+  assert.deepEqual(overlayOnly.nextOverlay, { 155: "155.mp4" });
+  // Manifest id: the overlay key becomes a tombstone, so the manifest
+  // entry cannot resurrect the dead URL.
+  const manifestId = applyVoiceDelete({}, 55, "55.ogg");
+  assert.equal(manifestId.hadRecording, true);
+  assert.equal(manifestId.filename, "55.ogg");
+  assert.equal(manifestId.inManifest, true);
+  assert.deepEqual(manifestId.nextOverlay, { 55: RECORDED_DELETED });
+  // Manifest id with a fresher overlay file: the overlay filename is
+  // the one to delete, the tombstone still lands.
+  const overlayWins = applyVoiceDelete({ 55: "55.mp4" }, 55, "55.ogg");
+  assert.equal(overlayWins.filename, "55.mp4");
+  assert.deepEqual(overlayWins.nextOverlay, { 55: RECORDED_DELETED });
+  // Nothing stored anywhere: not-found, overlay untouched.
+  const missing = applyVoiceDelete({ 155: "155.mp4" }, 999, null);
+  assert.equal(missing.hadRecording, false);
+  assert.equal(missing.filename, null);
+  assert.deepEqual(missing.nextOverlay, { 155: "155.mp4" });
+  // A stale tombstone for an id the manifest no longer has is cleaned.
+  const stale = applyVoiceDelete({ 55: RECORDED_DELETED }, 55, null);
+  assert.equal(stale.hadRecording, false);
+  assert.deepEqual(stale.nextOverlay, {});
+});
+
+test("record-voice: voiceDeleteR2Keys removes the raw file and its .mp3 sibling", () => {
+  assert.deepEqual(voiceDeleteR2Keys("25318.mp4"), ["recorded/25318.mp4", "recorded/25318.mp3"]);
+  assert.deepEqual(voiceDeleteR2Keys("55.ogg"), ["recorded/55.ogg", "recorded/55.mp3"]);
+  assert.deepEqual(voiceDeleteR2Keys("55.mp3"), ["recorded/55.mp3"], "an mp3 has no sibling to clean");
+  assert.deepEqual(voiceDeleteR2Keys(null), []);
+  assert.deepEqual(voiceDeleteR2Keys(""), []);
 });

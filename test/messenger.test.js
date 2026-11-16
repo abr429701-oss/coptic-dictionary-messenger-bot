@@ -18,7 +18,7 @@ import {
   MESSENGER_PICK_PREFIX,
   MESSENGER_SEND_URL,
 } from "../src/messenger.js";
-import { prebuiltAudioUrl, messengerVoiceUrl, recordedAudioUrl, humanAudioUrl } from "../src/neural-voice.js";
+import { prebuiltAudioUrl, messengerVoiceUrl, messengerVoiceUrlWithOverlay, recordedAudioUrl, humanAudioUrl } from "../src/neural-voice.js";
 import { oggCrc, parseOggPages } from "../src/ogg-repeat.js";
 import records from "../data/dictionary.json" with { type: "json" };
 import audioManifest from "../data/audio-manifest.json" with { type: "json" };
@@ -726,6 +726,33 @@ test("messengerVoiceUrl priority: recorded human, then prebuilt, then Joanna, th
   assert.ok(noId, "expected at least one record without an id");
   assert.equal(messengerVoiceUrl(env, noId), null);
   assert.equal(messengerVoiceUrl(env, null), null);
+});
+
+test("messengerVoiceUrlWithOverlay: a /voice_delete tombstone falls back to the prebuilt voice", async () => {
+  const { RECORDED_DELETED } = await import("../src/record-voice.js");
+  const recordedBase = "https://example.invalid/recorded";
+  const rec55 = records.find((r) => String(r.id) === "55");
+  assert.ok(rec55, "expected word 55 in the dictionary");
+  const withBase = { ...env, RECORDED_AUDIO_BASE_URL: recordedBase };
+  // Baseline: the manifest recording plays.
+  assert.equal(
+    messengerVoiceUrlWithOverlay(withBase, rec55, {}),
+    `${recordedBase}/55.ogg`,
+  );
+  // After /voice_delete the overlay holds the tombstone: the recorded
+  // tier is skipped and the prebuilt (Miguel/Salli) voice plays.
+  assert.equal(
+    messengerVoiceUrlWithOverlay(withBase, rec55, { 55: RECORDED_DELETED }),
+    prebuiltAudioUrl(withBase, 55),
+  );
+  // An overlay-only deletion (no manifest entry, e.g. word 25318) clears
+  // the key entirely, so the word also falls back to prebuilt — and the
+  // result never points at the recorded prefix.
+  const rec25318 = records.find((r) => String(r.id) === "25318");
+  assert.ok(rec25318, "expected word 25318 in the dictionary");
+  const fallback25318 = messengerVoiceUrlWithOverlay(withBase, rec25318, {});
+  assert.equal(fallback25318, prebuiltAudioUrl(withBase, 25318));
+  assert.ok(!String(fallback25318 ?? "").includes("/recorded/"), "never a recorded URL after the delete");
 });
 
 test("messenger bare number picks from the last list, same card as the quick reply", async () => {

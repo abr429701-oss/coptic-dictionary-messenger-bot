@@ -40,6 +40,12 @@ and the prebuilt-voice MP3 upload was stopped by the user on
 reaches Telegram only by sending the audio to the Telegram bot (it
 plays Telegram `file_id`s, which only it can mint).
 
+`/voice_delete <id>` removes one recording: the overlay entry (or a
+`__deleted__` tombstone when the id is in the baked-in manifest, so
+playback falls back to the prebuilt voice instead of the dead recorded
+URL) plus the R2 object and its `.mp3` sibling. A failed R2 delete
+still clears the voice and warns — the overlay alone decides playback.
+
 ## Routes
 
 - `GET /` — ready text

@@ -47,6 +47,14 @@
 
 export const RECORDED_R2_PREFIX = "recorded";
 export const RECORDED_OVERLAY_KEY = "recorded:overlay";
+// Tombstone for a deleted recording: the overlay value that means "this
+// word's recording was deleted — fall back to the prebuilt voice". It
+// exists because the baked-in manifest cannot be un-baked: an id in
+// data/recorded-voices.json still yields a recorded URL unless the live
+// overlay overrides it with this marker (recordedFilenameFor returns
+// null for it, mergeRecordedIds skips it). A fresh /record for the word
+// replaces the tombstone with the new filename.
+export const RECORDED_DELETED = "__deleted__";
 // Public base for the recorded prefix. The Worker var
 // RECORDED_AUDIO_BASE_URL must point here (with the /recorded suffix);
 // the default below is used when the var is unset.
@@ -154,24 +162,79 @@ export function recordPrompt(item, { recorded = 0, total = 0 } = {}) {
 
 // All recorded word ids: the baked-in manifest plus the live DO overlay.
 // Each source is an object { id: filename } or an array of id strings.
+// A tombstoned id (overlay value RECORDED_DELETED, see /voice_delete)
+// counts as NOT recorded, even when the manifest still names it —
+// otherwise /record would never offer the word again and /voicecoverage
+// would keep counting a deleted voice.
 export function mergeRecordedIds(manifest, overlay) {
   const ids = new Set();
+  const tombstoned = new Set();
+  if (overlay && typeof overlay === "object" && !Array.isArray(overlay)) {
+    for (const [key, value] of Object.entries(overlay)) {
+      if (value === RECORDED_DELETED) tombstoned.add(String(key));
+    }
+  }
   for (const source of [manifest, overlay]) {
     if (!source || typeof source !== "object") continue;
     const keys = Array.isArray(source) ? source : Object.keys(source);
-    for (const key of keys) ids.add(String(key));
+    for (const key of keys) {
+      if (!tombstoned.has(String(key))) ids.add(String(key));
+    }
   }
   return ids;
 }
 
 // Which file plays for a word: the live overlay wins over the baked-in
 // manifest (a fresh recording is live before its manifest line lands).
+// A tombstoned overlay entry (RECORDED_DELETED, see /voice_delete)
+// returns null, so playback falls back to the prebuilt voice instead
+// of the dead recorded URL.
 export function recordedFilenameFor(id, manifest, overlay) {
   if (id == null) return null;
   const key = String(id);
-  if (overlay && Object.hasOwn(overlay, key)) return overlay[key];
+  if (overlay && Object.hasOwn(overlay, key)) {
+    const value = overlay[key];
+    if (value === RECORDED_DELETED) return null;
+    return value;
+  }
   if (manifest && Object.hasOwn(manifest, key)) return manifest[key];
   return null;
+}
+
+// Plan a /voice_delete: which R2 file to remove and what the overlay
+// becomes. Pure (no DO/R2): the caller saves nextOverlay and deletes
+// the keys. An id in the baked-in manifest gets a tombstone (the manifest
+// still names it, so removing the overlay key alone would resurrect the
+// dead URL); an overlay-only id simply loses its key. A stale tombstone
+// for an id the manifest no longer has is cleaned up. Returns
+// { nextOverlay, filename, hadRecording, inManifest } — hadRecording is
+// false when nothing was stored anywhere (overlay or manifest).
+export function applyVoiceDelete(overlay, id, manifestFilename = null) {
+  const key = String(id);
+  const base = overlay && typeof overlay === "object" && !Array.isArray(overlay) ? { ...overlay } : {};
+  const overlayValue = Object.hasOwn(base, key) ? base[key] : undefined;
+  const overlayFile = overlayValue && overlayValue !== RECORDED_DELETED ? overlayValue : null;
+  const filename = overlayFile ?? manifestFilename ?? null;
+  if (!filename) {
+    if (overlayValue === RECORDED_DELETED) delete base[key];
+    return { nextOverlay: base, filename: null, hadRecording: false, inManifest: Boolean(manifestFilename) };
+  }
+  if (manifestFilename) base[key] = RECORDED_DELETED;
+  else delete base[key];
+  return { nextOverlay: base, filename, hadRecording: true, inManifest: Boolean(manifestFilename) };
+}
+
+// R2 keys a delete must remove for one stored recording: the raw file
+// plus its .mp3 sibling when one could exist. The sibling matters: a
+// stale recorded/<id>.mp3 would win over a later re-recording, because
+// playback prefers the .mp3 sibling whenever it exists
+// (resolveRecordedPlayback). Deleting a missing key is a no-op on R2.
+export function voiceDeleteR2Keys(filename) {
+  if (!filename || typeof filename !== "string") return [];
+  const keys = [`${RECORDED_R2_PREFIX}/${filename}`];
+  const sibling = mp3Sibling(filename);
+  if (sibling) keys.push(`${RECORDED_R2_PREFIX}/${sibling}`);
+  return keys;
 }
 
 // The .mp3 sibling of a stored recording: recorded/55.ogg ->

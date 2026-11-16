@@ -789,6 +789,17 @@ export default {
         // syncs from the Telegram repo every 30 min). The converter
         // script (scripts/convert-recorded.mjs) later produces the .mp3
         // sibling so the recording also plays on WhatsApp/Telegram.
+        // /voice_delete removes the same keys (raw file + .mp3 sibling)
+        // through deleteRecording below.
+        deleteRecording: async (key) => {
+          if (!env.RECORDINGS) return { ok: false, error: "r2-unconfigured" };
+          try {
+            await env.RECORDINGS.delete(key);
+            return { ok: true };
+          } catch (error) {
+            return { ok: false, error: error instanceof Error ? error.message : "r2-delete-failed" };
+          }
+        },
         putRecording: async (key, bytes, contentType) => {
           if (!env.RECORDINGS) return { ok: false, error: "r2-unconfigured" };
           try {

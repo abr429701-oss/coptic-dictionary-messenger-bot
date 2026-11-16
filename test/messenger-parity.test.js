@@ -825,3 +825,97 @@ test("record: voicecoverage counts the manifest plus the live overlay", async ()
   const after = await parity.handleText(ADMIN_PSID, "/voicecoverage");
   assert.match(after.texts[0].text, /3 كلمة/u, "a fresh /record counts before its manifest line lands");
 });
+
+// ---------------------------------------------------------------------------
+// Voice delete (/voice_delete)
+// ---------------------------------------------------------------------------
+
+// A parity instance whose DO overlay lives in a Map the test can read,
+// and whose R2 deletes are captured instead of executed.
+function makeDeleteParity(seedOverlay = {}, deleteRecordingImpl = null) {
+  const overlayStore = new Map();
+  if (Object.keys(seedOverlay).length) overlayStore.set("recorded:overlay", { ...seedOverlay });
+  const deletedKeys = [];
+  const inner = deleteRecordingImpl ?? (async () => ({ ok: true }));
+  const parity = makeParity({
+    adminStore: {
+      get: async (key) => overlayStore.get(String(key)) ?? null,
+      put: async (key, value) => { overlayStore.set(String(key), value); return true; },
+      del: async (key) => overlayStore.delete(String(key)),
+    },
+    deleteRecording: async (key) => { deletedKeys.push(key); return inner(key); },
+  });
+  return { parity, overlayStore, deletedKeys };
+}
+
+test("voice_delete: non-admins get silence; missing/invalid id gets the usage hint", async () => {
+  const { parity } = makeDeleteParity();
+  assert.deepEqual(await parity.handleText(USER_PSID, "/voice_delete 55"), { texts: [], voiceUrl: null });
+  for (const bad of ["/voice_delete", "/voice_delete abc", "/voice_delete 0", "/voice_delete -5", "/voice_delete 1.5"]) {
+    const plan = await parity.handleText(ADMIN_PSID, bad);
+    assert.match(plan.texts[0].text, /الاستخدام: \/voice_delete <رقم الكلمة>/u, bad);
+  }
+});
+
+test("voice_delete: the 25318 case — an overlay-only recording is removed, R2 keys deleted", async () => {
+  const { parity, overlayStore, deletedKeys } = makeDeleteParity({ 25318: "25318.mp4", 155: "155.mp4" });
+  const plan = await parity.handleText(ADMIN_PSID, "/voice_delete 25318");
+  assert.match(plan.texts[0].text, /تم حذف التسجيل الصوتي للكلمة 25318/u);
+  assert.match(plan.texts[0].text, /ستعود للنطق المُولَّد/u);
+  assert.doesNotMatch(plan.texts[0].text, /تعذّر/u, "no R2 warning when the delete succeeds");
+  assert.deepEqual(deletedKeys, ["recorded/25318.mp4", "recorded/25318.mp3"], "raw file + .mp3 sibling");
+  assert.deepEqual(overlayStore.get("recorded:overlay"), { 155: "155.mp4" }, "the key is removed, not tombstoned — the manifest never had it");
+});
+
+test("voice_delete: Arabic-Indic digits fold like everywhere else", async () => {
+  const { parity, overlayStore } = makeDeleteParity({ 25318: "25318.mp4" });
+  const plan = await parity.handleText(ADMIN_PSID, "/voice_delete ٢٥٣١٨");
+  assert.match(plan.texts[0].text, /تم حذف التسجيل الصوتي للكلمة 25318/u);
+  assert.deepEqual(overlayStore.get("recorded:overlay"), {});
+});
+
+test("voice_delete: a manifest id is tombstoned so playback falls back to prebuilt", async () => {
+  const { RECORDED_DELETED } = await import("../src/record-voice.js");
+  const { parity, overlayStore, deletedKeys } = makeDeleteParity();
+  const plan = await parity.handleText(ADMIN_PSID, "/voice_delete 55");
+  assert.match(plan.texts[0].text, /تم حذف التسجيل الصوتي للكلمة 55/u);
+  assert.deepEqual(deletedKeys, ["recorded/55.ogg", "recorded/55.mp3"]);
+  assert.deepEqual(overlayStore.get("recorded:overlay"), { 55: RECORDED_DELETED });
+  // The tombstone stops the count too: /voicecoverage drops to 1.
+  const coverage = await parity.handleText(ADMIN_PSID, "/voicecoverage");
+  assert.match(coverage.texts[0].text, /1 كلمة/u);
+});
+
+test("voice_delete: an id with no recording reports not-found and deletes nothing", async () => {
+  const { parity, overlayStore, deletedKeys } = makeDeleteParity({ 155: "155.mp4" });
+  const plan = await parity.handleText(ADMIN_PSID, "/voice_delete 999");
+  assert.match(plan.texts[0].text, /لا يوجد تسجيل صوتي محفوظ للكلمة 999/u);
+  assert.deepEqual(deletedKeys, []);
+  assert.deepEqual(overlayStore.get("recorded:overlay"), { 155: "155.mp4" }, "overlay untouched");
+});
+
+test("voice_delete: a failed R2 delete still clears the voice and warns", async () => {
+  const { parity, overlayStore, deletedKeys } = makeDeleteParity(
+    { 25318: "25318.mp4" },
+    async () => ({ ok: false, error: "r2-down" }),
+  );
+  const plan = await parity.handleText(ADMIN_PSID, "/voice_delete 25318");
+  assert.match(plan.texts[0].text, /تم حذف التسجيل الصوتي للكلمة 25318/u, "the overlay clear is what fixes playback");
+  assert.match(plan.texts[0].text, /تعذّر حذف الملف من R2 \(r2-down\)/u);
+  assert.deepEqual(overlayStore.get("recorded:overlay"), {}, "overlay cleared despite the R2 failure");
+});
+
+test("voice_delete: an unwired R2 delete still clears the voice and says so", async () => {
+  const overlayStore = new Map([["recorded:overlay", { 25318: "25318.mp4" }]]);
+  const bare = makeParity({
+    adminStore: {
+      get: async (key) => overlayStore.get(String(key)) ?? null,
+      put: async (key, value) => { overlayStore.set(String(key), value); return true; },
+      del: async (key) => overlayStore.delete(String(key)),
+    },
+  });
+  const plan = await bare.handleText(ADMIN_PSID, "/voice_delete 25318");
+  assert.match(plan.texts[0].text, /تم حذف التسجيل الصوتي للكلمة 25318/u);
+  assert.match(plan.texts[0].text, /حذف نسخة R2 غير موصّل/u);
+  assert.deepEqual(overlayStore.get("recorded:overlay"), {});
+});

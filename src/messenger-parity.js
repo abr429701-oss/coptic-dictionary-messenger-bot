@@ -75,7 +75,7 @@ import {
   getCodePhoneValid,
 } from "./getcode.js";
 import { buildQuickReplies, plainTextCard } from "./messenger.js";
-import { listRecordedVoiceIds } from "./neural-voice.js";
+import { listRecordedVoiceIds, recordedManifestFilename } from "./neural-voice.js";
 import {
   RECORDED_OVERLAY_KEY,
   RECORDED_R2_PREFIX,
@@ -85,6 +85,8 @@ import {
   recordedFileName,
   recordPrompt,
   mergeRecordedIds,
+  applyVoiceDelete,
+  voiceDeleteR2Keys,
 } from "./record-voice.js";
 
 export const WORKER_BASE_URL = "https://coptic-dictionary-messenger-bot.abr429701.workers.dev";
@@ -860,8 +862,9 @@ export function createMessengerParity(deps = {}) {
     createTicket = null, // ({ userId, subject, kind }) => { id } | null
     runUserCommand = null, // (cmd, arg, senderId) => plan | null — owning agent
     getDictAudit = null, // () => { duplicates, emptyMeaning, ... } | null
-    deleteVoice = null, // (wordId) => boolean
+    deleteVoice = null, // (wordId) => boolean — Telegram-pipeline stub for voice_delete_all/_many only
     putRecording = null, // (r2Key, bytes, contentType) => { ok, error } — R2 upload for /record
+    deleteRecording = null, // (r2Key) => { ok, error } — R2 delete for /voice_delete
     fetchImpl = null, // fetch for downloading the admin's audio attachment
     searchWords = null, // (query) => [{ id, coptic, pronunciation, english, meaning }] — for /record_choose
     nextUnrecorded = null, // (recordedIds:Set<string>) => { id, coptic, ... , recorded, total } | null — for /record
@@ -956,6 +959,33 @@ export function createMessengerParity(deps = {}) {
 
   async function recordedIds() {
     return mergeRecordedIds(listRecordedVoiceIds(), await recordedOverlay());
+  }
+
+  // -- voice delete (/voice_delete) ----------------------------------------
+  // Remove one recorded voice: the DO overlay entry (or a tombstone when
+  // the id is in the baked-in manifest, so playback falls back to the
+  // prebuilt voice instead of the dead recorded URL — record-voice.js
+  // RECORDED_DELETED), plus the R2 object and its .mp3 sibling. The R2
+  // delete is hygiene, not correctness: the overlay/tombstone alone
+  // decides playback, so a failed or unwired R2 delete still clears the
+  // voice and only leaves an orphan file (reported in the result).
+  async function deleteRecordedVoice(id) {
+    const overlay = await recordedOverlay();
+    const manifestFilename = recordedManifestFilename(id);
+    const result = applyVoiceDelete(overlay, id, manifestFilename);
+    if (!result.hadRecording) return { status: "not-found", id };
+    let r2Error = null;
+    let r2Skipped = false;
+    if (deleteRecording) {
+      for (const key of voiceDeleteR2Keys(result.filename)) {
+        const r = await safeCall(deleteRecording, key);
+        if (!r?.ok) { r2Error = r?.error ?? "r2-delete-failed"; break; }
+      }
+    } else {
+      r2Skipped = true;
+    }
+    await saveRecordedOverlay(result.nextOverlay);
+    return { status: "deleted", id, filename: result.filename, inManifest: result.inManifest, r2Error, r2Skipped };
   }
 
   async function beginRecord(senderId, state) {
@@ -2513,11 +2543,14 @@ export function createMessengerParity(deps = {}) {
         if (cmd === "record_stop") return stopRecord(senderId, state);
         if (cmd === "voice_delete" || cmd === "voice_delete_all" || cmd === "voice_delete_many") {
           if (cmd === "voice_delete") {
-            const id = Number(String(arg ?? "").trim());
-            if (!Number.isInteger(id)) return textPlan("✏️ الاستخدام: /voice_delete <رقم الكلمة>");
-            if (!deleteVoice) return notWiredText("حذف الصوت");
-            const ok = await safeCall(deleteVoice, id);
-            return textPlan(ok ? `✅ تم حذف صوت الكلمة ${id} — ستعود للنطق المُولَّد.` : `❌ تعذّر حذف صوت الكلمة ${id}.`);
+            const id = Number(foldDigits(String(arg ?? "").trim()));
+            if (!Number.isInteger(id) || id <= 0) return textPlan("✏️ الاستخدام: /voice_delete <رقم الكلمة>");
+            const result = await deleteRecordedVoice(id);
+            if (result.status === "not-found") return textPlan(`ℹ️ لا يوجد تسجيل صوتي محفوظ للكلمة ${id}.`);
+            const lines = [`✅ تم حذف التسجيل الصوتي للكلمة ${id} — ستعود للنطق المُولَّد.`];
+            if (result.r2Error) lines.push(`⚠️ تعذّر حذف الملف من R2 (${result.r2Error}) — الملف المتبقي معزول ولن يُشغَّل.`);
+            else if (result.r2Skipped) lines.push("⚠️ حذف نسخة R2 غير موصّل في هذا الربط — تحقق من ملف recorded/ في R2.");
+            return textPlan(lines.join("\n"));
           }
           return { __confirm: { command: cmd, arg, label: `حذف ${cmd === "voice_delete_all" ? "كل الأصوات المسجلة" : "الأصوات المطلوبة"}` } };
         }
