@@ -836,6 +836,32 @@ export default {
         editDictionary: null, // Apps Script dictionary-admin route, unwired
         runTask: null, // job tasks run via plan.task (see executeTask)
       });
+      // Live monitoring (Telegram /livemon parity): every incoming
+      // message from a non-admin is logged to the DO conversation log,
+      // and while /livemon is ON it is forwarded live to the first
+      // admin PSID (same "first admin" convention as the name-gate
+      // send-dm). The forward is a DIRECT sendMessengerMessage, never
+      // a plan.task: the plan may already carry a task (e.g. the name
+      // gate's send-dm on registration) and a second task would
+      // collide. The hook is awaited so the forward is not lost when
+      // the webhook returns, and it is wrapped in try/catch so a
+      // logging/forward failure never breaks the user's reply. Admin
+      // messages are never logged or forwarded; bot replies are never
+      // logged (only inbound messages reach this hook).
+      async function liveMonitorHook(senderId, kind, text) {
+        try {
+          if (senderId == null || messengerParity.isAdmin(senderId)) return;
+          const logged = await messengerParity.logIncomingMessage(senderId, kind, text);
+          if (!logged || !(await messengerParity.liveMonitorOn())) return;
+          const adminPsids = String(env.MESSENGER_ADMIN_PSID ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+          if (!adminPsids.length) return;
+          const forward = await messengerParity.buildLiveForward(senderId, kind, text);
+          if (!forward) return;
+          await sendMessengerMessage(env, adminPsids[0], messengerTextMessage(forward));
+        } catch {
+          /* logging/forwarding never breaks the user's reply */
+        }
+      }
       const planFor = {
         // Parity first: flows (cert/get-code/exam), menus, commands.
         // A bare number is routed by recency — whichever list (parity
@@ -844,7 +870,17 @@ export default {
         // menu, and vice versa. While a parity flow is active (a cert
         // code, a get-code step, an exam code, a broadcast/confirm
         // pending), the number belongs to the flow, not to any list.
-        text: async (query, senderId) => {
+        text: async (query, senderId, attachments) => {
+          // Live monitor hook first: every inbound text (and every
+          // captioned attachment — the caption is the text) from a
+          // non-admin is logged, and forwarded while /livemon is ON.
+          // A non-audio attachment alongside the text means the text
+          // is a media caption (kind "media"); an audio attachment
+          // with text is ignored by the router, so it stays "text".
+          if (senderId != null) {
+            const hasMedia = Array.isArray(attachments) && attachments.some((a) => a?.type && a.type !== "audio");
+            await liveMonitorHook(senderId, hasMedia ? "media" : "text", query);
+          }
           // First-time name registration (Telegram parity): the gate
           // runs before flows and search; a plan means the turn is
           // answered here, null means normal routing (commands, flows,
@@ -904,7 +940,13 @@ export default {
         // A voice message (audio attachment, no text): the /record flow
         // owns it when an admin session is open; anything else stays
         // silent (non-admin voices and stray voices are ignored).
-        audio: async (attachment, senderId) => messengerParity.handleAudio(senderId, attachment),
+        // The live monitor logs the voice and forwards it while ON
+        // before the record flow decides — admin voices are never
+        // logged or forwarded (the hook gates on isAdmin).
+        audio: async (attachment, senderId) => {
+          await liveMonitorHook(senderId, "voice", "");
+          return messengerParity.handleAudio(senderId, attachment);
+        },
         executeTask: (task, senderId, fetchImpl) => executeMessengerTask(env, task, senderId, fetchImpl, { ctx }),
       };
       // Fast-ack like the Telegram webhook: answer Meta 200 immediately and

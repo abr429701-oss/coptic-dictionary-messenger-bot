@@ -378,13 +378,16 @@ export async function sendWordVoice(env, senderId, voiceUrl, fetchImpl = globalT
 // Event handling
 // -----------------------------------------------------------------------------
 
-// One messaging event. planFor.text(query, senderId) /
+// One messaging event. planFor.text(query, senderId, attachments) /
 // planFor.pick(indexOrPayload, senderId) /
 // planFor.audio(attachment, senderId) return a plan
 // { texts: [{ text, quickReplies }], voiceUrl, attachments?, photoBytes?, task? }
 // or null to stay silent. planFor.audio fires for an incoming audio
 // attachment (a Messenger voice message) when the message carries no
-// text or quick reply — the /record flow owns it.
+// text or quick reply — the /record flow owns it. planFor.text also
+// receives the message's attachments (third arg): a captioned photo /
+// video arrives as text + attachment, and the live monitor logs it as
+// kind "media" with the caption as its text.
 // Send order per plan: typing_on first (the user sees "يكتب..." while the
 // plan is computed), then attachments (lesson media by URL), then a
 // photo upload, then the texts in order, then the voice — exactly one
@@ -416,7 +419,7 @@ export async function handleMessengerMessaging(env, event, planFor, fetchImpl = 
       // A parity quick reply: route the raw payload to the owning agent.
       plan = await planFor.pick(payload, senderId);
     } else if (typeof message.text === "string" && message.text.trim()) {
-      plan = await planFor.text(message.text, senderId);
+      plan = await planFor.text(message.text, senderId, message.attachments);
     } else if (Array.isArray(message.attachments) && typeof planFor.audio === "function") {
       // An audio attachment with no text: a voice message. Only the
       // audio attachment is routed (photos/files stay silent here);

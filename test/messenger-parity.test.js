@@ -108,9 +108,9 @@ function makeParity(deps = {}) {
 test("admin audit covers all 332 Telegram commands exactly once, plus 2 Messenger extras", () => {
   const counts = adminAuditCounts();
   assert.equal(counts.total, 334);
-  assert.equal(counts.impl, 198);
+  assert.equal(counts.impl, 201);
   assert.equal(counts.dispatch, 57);
-  assert.equal(counts.na, 79);
+  assert.equal(counts.na, 76);
   const seen = new Set();
   for (const row of ADMIN_AUDIT) {
     assert.ok(!seen.has(row.command), `duplicate audit row: ${row.command}`);
@@ -128,6 +128,10 @@ test("admin audit covers all 332 Telegram commands exactly once, plus 2 Messenge
 test("admin audit statuses: Telegram-only, dispatch, and implemented samples", () => {
   assert.equal(adminCommandStatus("menuadmin").status, "na");
   assert.match(adminCommandStatus("menuadmin").reason, /تيليجرام/u);
+  assert.equal(adminCommandStatus("livemon").status, "impl", "live monitor is implemented (DO log + forward)");
+  assert.equal(adminCommandStatus("conversations").status, "impl", "conversation list reads the DO recency index");
+  assert.equal(adminCommandStatus("userchat").status, "impl", "user chat reads the DO per-user log");
+  assert.equal(adminCommandStatus("livesearch").status, "na", "live search stays Telegram-only");
   assert.equal(adminCommandStatus("record").status, "impl");
   assert.equal(adminCommandStatus("record_choose").status, "impl");
   assert.equal(adminCommandStatus("record_stop").status, "impl");
@@ -601,7 +605,7 @@ test("admin settings persist in the store: motd, feature, blacklist", async () =
 
 test("Telegram-only admin commands answer with the reason, never silence, never a crash", async () => {
   const parity = makeParity();
-  for (const cmd of ["/menuadmin", "/livemon", "/conversations", "/webhook", "/exportcsv", "/2fa", "/keyboard"]) {
+  for (const cmd of ["/menuadmin", "/livesearch", "/webhook", "/exportcsv", "/2fa", "/keyboard"]) {
     const plan = await parity.handleText(ADMIN_PSID, cmd);
     assert.ok(plan?.texts?.[0]?.text?.includes("غير متاح على ماسنجر"), `${cmd} must explain why it is not applicable`);
   }

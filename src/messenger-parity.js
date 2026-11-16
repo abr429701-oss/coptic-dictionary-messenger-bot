@@ -443,6 +443,54 @@ export function certResultToPlan(result) {
 }
 
 // ---------------------------------------------------------------------------
+// Live monitoring (/livemon, /conversations, /userchat) — pure helpers
+// and DO key names. Telegram parity (final-code-fix src/index.js:
+// liveMonitorOn/setLiveMonitor, forwardLiveMessage, trackConvMessage /
+// getUserConv / getActiveConvUsers): every incoming private message
+// from a non-admin is logged, and while the monitor is ON it is also
+// forwarded live to the first admin PSID. The log lives entirely in
+// the Durable Object via the injected adminStore — the DO exposes no
+// list op, so /conversations reads the explicit recency index
+// (CONV_ACTIVE_KEY); the per-user log is one key per PSID.
+// ---------------------------------------------------------------------------
+
+// DO keys (Telegram parity: `livemon:enabled` is the same key name;
+// the conv keys are Messenger-namespaced so they can never collide
+// with a Telegram `conv:<id>` row in a shared store).
+export const LIVEMON_KEY = "livemon:enabled";
+export const CONV_KEY_PREFIX = "msgr:conv:";
+export const CONV_ACTIVE_KEY = "msgr:conv:active";
+export const CONV_MAX_PER_USER = 100;
+export const CONV_REPORT_MAX = 20;
+export const CONV_USERCHAT_MAX = 30;
+
+// Exact toggle replies (Telegram's wording, adapted: Telegram's ON text
+// promises a ↩️ quick-reply button, which does not exist on Messenger —
+// the admin replies with /msg instead).
+export const LIVEMON_ON_TEXT = "🔴 تم تشغيل المراقبة المباشرة — ستصلك رسائل المستخدمين فور وصولها. رد عليهم بـ /msg <PSID> <نص>. أوقفها بـ /livemon.";
+export const LIVEMON_OFF_TEXT = "⚪ تم إيقاف المراقبة المباشرة — لن تصلك رسائل المستخدمين لحظيًا. المحادثات تظل محفوظة وتُراجَع بـ /conversations و /userchat.";
+
+// Label for a non-text log entry, in the forward and in /userchat.
+// A voice entry stores text "" — the label comes from the kind.
+export function convKindLabel(kind) {
+  return { text: "", voice: "🎤 رسالة صوتية", media: "📎 وسائط" }[kind] ?? "📎 وسائط";
+}
+
+// One live forward to the admin: sender name + PSID + time + message
+// (sliced to 1000 chars, Telegram's forward cap), then the /msg hint
+// on its own line. No asterisks around names (display rule), one
+// command per line. `at` is an ISO string; `text` is the caption for
+// media, "" for voice.
+export function formatLiveForward({ name, psid, at, kind, text }) {
+  const when = at ? new Date(at).toLocaleTimeString("en-GB") : new Date().toLocaleTimeString("en-GB");
+  const who = `🔴 ${String(name ?? "").trim() || "بدون اسم"} (${String(psid)}) • ${when}`;
+  const body = kind === "text"
+    ? String(text ?? "").slice(0, 1000)
+    : `${convKindLabel(kind)}${text ? ` ${String(text).slice(0, 1000)}` : ""}`;
+  return `${who}\n${body}\nرد بـ /msg ${String(psid)} <نص>`;
+}
+
+// ---------------------------------------------------------------------------
 // Admin subset (mirrors the WhatsApp port's admin.js)
 // ---------------------------------------------------------------------------
 
@@ -463,9 +511,8 @@ export function certResultToPlan(result) {
 //   na       — inherently Telegram-only: listed explicitly with a reason,
 //              never silently dropped.
 //
-// Counts (see ADMIN_AUDIT / adminAuditCounts()): impl 191, dispatch 57,
-// na 84 = 332. Plus 2 Messenger extras beyond the 332: /reload (data
-// refresh report) and /bans (alias of /banlist).
+// Counts (see ADMIN_AUDIT / adminAuditCounts()): impl 201, dispatch 57,
+// na 76 = 334 (332 Telegram commands + 2 Messenger extras).
 // ---------------------------------------------------------------------------
 
 export const ADMIN_CATEGORIES = [
@@ -487,10 +534,7 @@ export const ADMIN_CATEGORIES = [
 // Telegram-only commands, each with its one-line reason. Everything not
 // listed here and not in ADMIN_DISPATCH_COMMANDS is implemented.
 export const ADMIN_NOT_APPLICABLE = {
-  // Stats: Telegram live monitoring reads Telegram conversations.
-  conversations: "مراقبة المحادثات الحية في تيليجرام — لا يوجد مقابل في ماسنجر",
-  userchat: "عرض محادثة مستخدم تيليجرام — لا يوجد مقابل في ماسنجر",
-  livemon: "بث رسائل تيليجرام الحية للأدمن — لا يوجد مقابل في ماسنجر",
+  // Stats: Telegram live search / timeline reads Telegram updates.
   livesearch: "بحث حي في رسائل تيليجرام — لا يوجد مقابل في ماسنجر",
   usertimeline: "الخط الزمني لتحديثات مستخدم تيليجرام — لا يوجد مقابل في ماسنجر",
   trace: "تتبع تحديث تيليجرام (update trace) — خاص بتيليجرام",
@@ -1499,6 +1543,151 @@ export function createMessengerParity(deps = {}) {
     return withQuickRepliesOnLast(plan, items);
   }
 
+  // -- live monitoring (/livemon, /conversations, /userchat) ------------
+  // Telegram parity, adapted to this Worker:
+  //
+  // - The flag and the log live in the DO (adminStore), read/written on
+  //   every message. There is deliberately NO in-isolate cache here:
+  //   the recorded-overlay pattern (60 s TTL in src/index.js) would
+  //   keep forwarding for up to a minute after the admin turns the
+  //   monitor OFF, and a module-scope cache survives only in one
+  //   isolate anyway — the DO is the only source of truth shared by
+  //   all isolates. One DO get per inbound message is the cost of an
+  //   OFF that takes effect on the very next message.
+  // - The log is a direct DO write per message, not an in-memory
+  //   buffer: Messenger has no poller/alarm to flush a buffer (unlike
+  //   Telegram's flushConvLog), and createMessengerParity is built
+  //   fresh per webhook request, so a factory-closure buffer would be
+  //   lost with the request. Cost: one get + one put per conv key,
+  //   plus one get + one put for the recency index, per message.
+  // - The wiring (src/index.js planFor.text / planFor.audio) calls
+  //   logIncomingMessage for every inbound message and forwards with
+  //   a DIRECT sendMessengerMessage — never a plan.task, because the
+  //   plan may already carry one (e.g. the name gate's send-dm) and
+  //   a second task would collide. A logging/forward failure never
+  //   breaks the user's reply: the wiring wraps the hook in try/catch
+  //   and these helpers swallow store errors themselves.
+  // - Bot replies are never logged: nothing in this module writes to
+  //   the conv keys except logIncomingMessage, which the wiring calls
+  //   only for inbound user messages. Admin messages are never logged
+  //   or forwarded (isAdmin gate, both here and in the wiring).
+  // - Every command branch below ALWAYS returns a plan, including the
+  //   empty cases — Telegram's /conversations returns NO reply at all
+  //   when empty (silence, undiagnosed since 2026-11-08); this module
+  //   must never repeat that.
+
+  async function liveMonitorOn() {
+    return Boolean(await safeCall(store.get, LIVEMON_KEY));
+  }
+
+  // Log one inbound message. Returns true when the sender is a
+  // loggable non-admin (i.e. the message was eligible for logging and
+  // forwarding), even if a DO write failed — the log is best-effort,
+  // the forward decision is separate. `text` is the message text, the
+  // caption for media, "" for voice (the label comes from the kind).
+  async function logIncomingMessage(senderId, kind, text) {
+    if (senderId == null || isAdmin(senderId)) return false;
+    const psid = String(senderId);
+    const at = new Date().toISOString();
+    const entryKind = kind === "voice" || kind === "media" ? kind : "text";
+    const entry = {
+      at,
+      kind: entryKind,
+      text: entryKind === "voice" ? "" : String(text ?? "").slice(0, 500),
+    };
+    try {
+      const prev = (await safeCall(store.get, `${CONV_KEY_PREFIX}${psid}`)) ?? [];
+      const list = Array.isArray(prev) ? [...prev, entry] : [entry];
+      await safeCall(store.put, `${CONV_KEY_PREFIX}${psid}`, list.slice(-CONV_MAX_PER_USER));
+      const rawActive = (await safeCall(store.get, CONV_ACTIVE_KEY)) ?? {};
+      const index = rawActive && typeof rawActive === "object" && !Array.isArray(rawActive) ? { ...rawActive } : {};
+      const prior = index[psid] ?? {};
+      // The sender name is NOT looked up here (that would cost a DO
+      // get per message): it is resolved lazily by /conversations for
+      // the 20 users shown, and by buildLiveForward only when a
+      // forward is actually sent. A stored name, when present, is kept.
+      index[psid] = { name: prior.name ?? "", at, count: (Number(prior.count) || 0) + 1 };
+      await safeCall(store.put, CONV_ACTIVE_KEY, index);
+    } catch {
+      /* logging never breaks the user's reply */
+    }
+    return true;
+  }
+
+  // Build the live-forward text for one inbound message (name looked
+  // up from the `user:msgr:<PSID>` record via getUserRecord, falling
+  // back to the bare PSID). Returns null for admins / missing sender.
+  async function buildLiveForward(senderId, kind, text) {
+    if (senderId == null || isAdmin(senderId)) return null;
+    let name = "";
+    if (getUserRecord) {
+      const found = await safeCall(getUserRecord, String(senderId));
+      name = found?.record?.name ?? "";
+    }
+    return formatLiveForward({ name, psid: String(senderId), at: new Date().toISOString(), kind, text });
+  }
+
+  async function liveMonitorCommand(cmd, arg) {
+    switch (cmd) {
+      case "livemon": {
+        const on = !(await liveMonitorOn());
+        await safeCall(store.put, LIVEMON_KEY, on);
+        return textPlan(on ? LIVEMON_ON_TEXT : LIVEMON_OFF_TEXT);
+      }
+      case "conversations": {
+        const rawActive = (await safeCall(store.get, CONV_ACTIVE_KEY)) ?? {};
+        const index = rawActive && typeof rawActive === "object" && !Array.isArray(rawActive) ? rawActive : {};
+        const entries = Object.entries(index)
+          .map(([id, info]) => ({ id, name: info?.name ?? "", at: info?.at ?? "", count: Number(info?.count) || 0 }))
+          .sort((a, b) => (a.at < b.at ? 1 : a.at > b.at ? -1 : 0))
+          .slice(0, CONV_REPORT_MAX);
+        if (!entries.length) return textPlan("📭 لا توجد محادثات محفوظة بعد — تظهر هنا بعد أول رسالة من أي مستخدم.");
+        // Resolve display names lazily (best effort, in parallel):
+        // the index stores "" for names it never looked up.
+        const resolved = await Promise.all(entries.map(async (u) => {
+          if (u.name) return u;
+          if (!getUserRecord) return u;
+          const found = await safeCall(getUserRecord, u.id);
+          return { ...u, name: found?.record?.name ?? "" };
+        }));
+        const lines = [
+          "👥 المحادثات الأخيرة (الأحدث أولًا)",
+          "",
+          ...resolved.map((u) => `• ${u.name || "بدون اسم"} (${u.id}) — ${u.count} رسالة، آخرها ${u.at ? new Date(u.at).toLocaleString("en-GB") : "—"}`),
+          "",
+          "لعرض محادثة كاملة: /userchat <id>",
+        ];
+        // Meta caps one text message at 2000 chars; a 20-user report
+        // must stay sendable, or the admin gets silence.
+        return textPlan(lines.join("\n").slice(0, 1900));
+      }
+      case "userchat": {
+        const id = foldDigits(String(arg ?? "").trim()).split(/\s+/u)[0] ?? "";
+        if (!/^\d+$/u.test(id)) return textPlan("✏️ الاستخدام: /userchat <id>\nمثال: /userchat 123456789");
+        const raw = (await safeCall(store.get, `${CONV_KEY_PREFIX}${id}`)) ?? [];
+        const entries = Array.isArray(raw) ? raw : [];
+        if (!entries.length) return textPlan(`📭 لا توجد رسائل محفوظة للمستخدم ${id} بعد.`);
+        let name = "";
+        if (getUserRecord) {
+          const found = await safeCall(getUserRecord, id);
+          name = found?.record?.name ?? "";
+        }
+        const shown = entries.slice(-CONV_USERCHAT_MAX);
+        const lines = [`💬 محادثة ${name || "بدون اسم"} (${id}) — آخر ${shown.length} رسالة`, ""];
+        for (const e of shown) {
+          const time = e?.at ? new Date(e.at).toLocaleTimeString("en-GB") : "";
+          const label = e?.kind === "text"
+            ? String(e?.text ?? "")
+            : `${convKindLabel(e?.kind)}${e?.text ? ` ${String(e.text)}` : ""}`;
+          lines.push(`[${time}] ${label}`);
+        }
+        return textPlan(lines.join("\n").slice(0, 1900));
+      }
+      default:
+        return null;
+    }
+  }
+
   // -- full admin command dispatcher -----------------------------------------
   // Dangerous commands (delete / purge / reset data) run two-step: the
   // first call stores pendingConfirm and asks; "نعم" executes, "إلغاء"
@@ -1564,7 +1753,13 @@ export function createMessengerParity(deps = {}) {
     return lines.join("\n");
   }
 
-  async function statsCommand(cmd) {
+  async function statsCommand(cmd, arg) {
+    // Live monitoring reads the DO conversation log, not the stats
+    // snapshot: it answers even when getStats is unwired, and it
+    // ALWAYS replies (see liveMonitorCommand).
+    if (cmd === "livemon" || cmd === "conversations" || cmd === "userchat") {
+      return liveMonitorCommand(cmd, arg);
+    }
     const stats = getStats ? await safeCall(getStats) : null;
     if (!stats) return notWiredText("الإحصاءات");
     const head = (title) => `📊 ${title}\n`;
@@ -2520,7 +2715,7 @@ export function createMessengerParity(deps = {}) {
     }
     switch (status.category) {
       case "stats":
-        return statsCommand(cmd);
+        return statsCommand(cmd, arg);
       case "users":
         return usersCommand(senderId, cmd, arg);
       case "broadcast":
@@ -2896,7 +3091,7 @@ export function createMessengerParity(deps = {}) {
     return null;
   }
 
-  return { handleText, handlePick, handleAudio, isAdmin };
+  return { handleText, handlePick, handleAudio, isAdmin, logIncomingMessage, liveMonitorOn, buildLiveForward };
 }
 
 // Bare-number resolution against a stored menuList, exported for the

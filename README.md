@@ -13,7 +13,14 @@ The same bot the Page ran before the split — dictionary search with
 word cards and voice (recorded human first, then prebuilt Polly, then
 Joanna), paginated suggestion lists (15 per page), first-time name
 registration, learn (27 lessons, R2 media), in-chat exam code gate,
-certificates, get-code, and the admin subset. No inline keyboards, ever:
+certificates, get-code, and the admin subset. Live monitoring
+(`/livemon`, `/conversations`, `/userchat`, admin-only, OFF by default)
+mirrors Telegram: every private message from a non-admin is logged to
+the Durable Object (`msgr:conv:<PSID>`, capped at 100 per user, plus
+the `msgr:conv:active` recency index), `/livemon` toggles a live feed
+that forwards each message to the first admin PSID as it arrives, and
+the admin replies with `/msg <PSID> <text>` — bot replies and admin
+messages are never logged or forwarded. No inline keyboards, ever:
 quick replies are the only tap mechanism.
 
 ## Voice recording (/record)
