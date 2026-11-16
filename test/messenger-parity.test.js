@@ -39,6 +39,7 @@ import {
   R2_MEDIA_BASE_URL,
 } from "../src/messenger-parity.js";
 import { LEARN_LEVELS } from "../src/learn-manifest.js";
+import { createDispatchCommands, PARKED_DISPATCH_MESSAGES } from "../src/dispatch-commands.js";
 
 const ADMIN_PSID = "123456789012345";
 const USER_PSID = "987654321098765";
@@ -108,9 +109,9 @@ function makeParity(deps = {}) {
 test("admin audit covers all 332 Telegram commands exactly once, plus 2 Messenger extras", () => {
   const counts = adminAuditCounts();
   assert.equal(counts.total, 334);
-  assert.equal(counts.impl, 201);
-  assert.equal(counts.dispatch, 57);
-  assert.equal(counts.na, 76);
+  assert.equal(counts.impl, 245);
+  assert.equal(counts.dispatch, 12);
+  assert.equal(counts.na, 77);
   const seen = new Set();
   for (const row of ADMIN_AUDIT) {
     assert.ok(!seen.has(row.command), `duplicate audit row: ${row.command}`);
@@ -138,8 +139,11 @@ test("admin audit statuses: Telegram-only, dispatch, and implemented samples", (
   assert.equal(adminCommandStatus("exportcsv").status, "na");
   assert.equal(adminCommandStatus("schedule").status, "na");
   assert.equal(adminCommandStatus("2fa").status, "na");
-  assert.equal(adminCommandStatus("quiz").status, "dispatch");
-  assert.equal(adminCommandStatus("wordinfo").status, "dispatch");
+  assert.equal(adminCommandStatus("quiz").status, "dispatch", "parked quiz stays dispatch with its parked reason");
+  assert.equal(adminCommandStatus("quiz").reason, "الاختبارات داخل المحادثة غير مبنية في ماسنجر — الامتحانات برابط من /learn");
+  assert.equal(adminCommandStatus("wordinfo").status, "impl", "dispatch commands are wired now (src/dispatch-commands.js)");
+  assert.equal(adminCommandStatus("lang").status, "na", "language switching has no Messenger meaning");
+  assert.match(adminCommandStatus("lang").reason, /عربي فقط/u);
   assert.equal(adminCommandStatus("ban").status, "impl");
   assert.equal(adminCommandStatus("motd").status, "impl");
   assert.equal(adminCommandStatus("no-such-command"), null);
@@ -605,7 +609,7 @@ test("admin settings persist in the store: motd, feature, blacklist", async () =
 
 test("Telegram-only admin commands answer with the reason, never silence, never a crash", async () => {
   const parity = makeParity();
-  for (const cmd of ["/menuadmin", "/livesearch", "/webhook", "/exportcsv", "/2fa", "/keyboard"]) {
+  for (const cmd of ["/menuadmin", "/livesearch", "/webhook", "/exportcsv", "/2fa", "/keyboard", "/lang"]) {
     const plan = await parity.handleText(ADMIN_PSID, cmd);
     assert.ok(plan?.texts?.[0]?.text?.includes("غير متاح على ماسنجر"), `${cmd} must explain why it is not applicable`);
   }
@@ -622,6 +626,43 @@ test("dispatch commands run through the owning agent, or fall through when unwir
   const unwired = makeParity();
   assert.equal(await unwired.handleText(USER_PSID, "/quiz"), null, "without the dep, a user command falls through to its owner");
   assert.equal(await unwired.handleText(USER_PSID, "/wordinfo ⲁⲑⲙⲟϣⲓ"), null);
+});
+
+// The real wiring (src/dispatch-commands.js): every dispatch command
+// answers through both entry points — typed text (any user) and the
+// admin-menu quick reply (admin) — and none of them reaches the
+// "لم يتم توصيله بعد" placeholder. Parked quiz/game commands answer
+// with their honest paused message instead.
+test("dispatch commands are wired: no command reaches the unwired placeholder", async () => {
+  const runUserCommand = createDispatchCommands({
+    getUserRecord: async () => ({ record: { name: "لمياء" }, history: [{ q: "ⲁⲑⲙⲟϣⲓ" }] }),
+    saveUserRecord: async () => true,
+    clearHistory: async () => true,
+    wordCard: async (record) => ({ texts: [{ text: `CARD ${record.id}` }], voiceUrl: null }),
+    hasRecordedVoice: async () => false,
+    adminStore: { get: async () => null, put: async () => true, del: async () => true },
+    isAdmin: (psid) => psid === ADMIN_PSID,
+    firstAdminPsid: ADMIN_PSID,
+    listErrors: async () => [],
+  });
+  const parity = makeParity({ runUserCommand });
+  const args = {
+    wordsearch: "ⲁⲑⲙⲟϣⲓ", wordinfo: "ⲁⲑⲙⲟϣⲓ", translate: "ⲁⲑⲙⲟϣⲓ",
+    similar: "ⲁⲑⲙⲟϣⲓ", startswith: "ⲁ", pronounce: "ⲁⲑⲙⲟϣⲓ",
+    removefav: "ⲁⲑⲙⲟϣⲓ", suggestword: "ⲁⲑⲙⲟϣⲓ — معنى", contribute: "ⲁⲑⲙⲟϣⲓ — معنى",
+  };
+  for (const cmd of ADMIN_DISPATCH_COMMANDS) {
+    const arg = args[cmd] ? ` ${args[cmd]}` : "";
+    const viaText = await parity.handleText(USER_PSID, `/${cmd}${arg}`);
+    assert.ok(viaText, `/${cmd} via text must return a plan`);
+    assert.ok(!viaText.texts[0].text.includes("لم يتم توصيله بعد"), `/${cmd} via text must not hit the placeholder`);
+    const viaPick = await parity.handlePick(ADMIN_PSID, `admin|cmd:${cmd}`);
+    assert.ok(viaPick, `/${cmd} via admin pick must return a plan`);
+    assert.ok(!viaPick.texts[0].text.includes("لم يتم توصيله بعد"), `/${cmd} via admin pick must not hit the placeholder`);
+    if (PARKED_DISPATCH_MESSAGES[cmd]) {
+      assert.equal(viaText.texts[0].text, PARKED_DISPATCH_MESSAGES[cmd], `/${cmd} must answer with its parked message`);
+    }
+  }
 });
 
 test("/reload reports live counts and the auto-sync note", async () => {

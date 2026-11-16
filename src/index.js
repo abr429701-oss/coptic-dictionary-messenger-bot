@@ -35,6 +35,7 @@ import {
   parityHelpText,
   MAIN_MENU_ITEMS,
 } from "./messenger-parity.js";
+import { createDispatchCommands } from "./dispatch-commands.js";
 import { suggestSimilar } from "./new-features.js";
 import {
   storeCall,
@@ -143,6 +144,43 @@ async function resolveMessengerVoice(env, record, fetchImpl = globalThis.fetch) 
   let mp3Exists = false;
   if (base && filename) mp3Exists = await recordedMp3Exists(env, base, filename, fetchImpl);
   return messengerVoiceUrlWithOverlay(env, record, overlay, { mp3Exists });
+}
+
+// Search history for one Messenger user, written here (nothing wrote it
+// before — getUserHistory only read `history:<id>` / the legacy snapshot
+// plus an in-memory map nobody populated, so /recent, /fav and /mystats
+// had no data source). One DO put per search, newest-first on read,
+// capped at 20, duplicates collapse to the latest occurrence. Best
+// effort: a store failure never breaks the search reply. Commands
+// (text starting with "/") are never recorded — they are not searches.
+async function recordMessengerSearch(env, psid, query) {
+  const q = String(query ?? "").trim();
+  if (!q || q.startsWith("/") || !env?.USERS || psid == null) return;
+  try {
+    const key = `msgr:${psid}`;
+    const existing = await getUserHistory(env, key);
+    const entries = [...existing].reverse().map((h) => ({ q: String(h?.q ?? h ?? ""), at: Number(h?.at ?? 0) || Date.now() }));
+    entries.push({ q, at: Date.now() });
+    const deduped = [];
+    for (const entry of entries) {
+      const at = deduped.findIndex((e) => e.q === entry.q);
+      if (at >= 0) deduped.splice(at, 1);
+      deduped.push(entry);
+    }
+    await storeCall(env, { op: "put", key: `history:${key}`, value: deduped.slice(-20) });
+  } catch {
+    /* history is a convenience, not the reply */
+  }
+}
+
+async function clearMessengerHistory(env, psid) {
+  if (!env?.USERS || psid == null) return false;
+  try {
+    await storeCall(env, { op: "put", key: `history:msgr:${psid}`, value: [] });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export default {
@@ -514,12 +552,23 @@ export default {
     // one (null when it does not — the voice step is then skipped). Voice
     // priority is Telegram's: recorded human first, then prebuilt Polly,
     // then Joanna (see messengerVoiceUrl in neural-voice.js). The ×3
-    // repeat in the transport applies to whichever voice is served.
-    async function messengerCardPlan(env, record, searchedWord, partIndex = -1) {
-      if (!record) return { texts: [], voiceUrl: null };
+    // repeat in the transport applies to whichever voice is served, and
+    // the user's voice prefs on `user:msgr:<PSID>` are honored here:
+    // voiceOff suppresses the voice entirely, voiceRepeats 1 sends the
+    // file once (/voiceonce) instead of the default 3× (/voicethree).
+    async function messengerCardPlan(env, record, searchedWord, partIndex = -1, senderId = null) {
+      if (!record) return { texts: [], voiceUrl: null, voiceRepeats: 3 };
+      let voiceOff = false;
+      let voiceRepeats = 3;
+      if (senderId != null) {
+        const prefs = await getUser(env, `msgr:${senderId}`);
+        voiceOff = Boolean(prefs?.voiceOff);
+        voiceRepeats = prefs?.voiceRepeats === 1 ? 1 : 3;
+      }
       return {
         texts: [{ text: plainTextCard(formatRecord(record, partIndex, searchedWord)) }],
-        voiceUrl: record.id != null ? await resolveMessengerVoice(env, record) : null,
+        voiceUrl: !voiceOff && record.id != null ? await resolveMessengerVoice(env, record) : null,
+        voiceRepeats,
       };
     }
 
@@ -632,7 +681,7 @@ export default {
           const n = Number(folded);
           const globalAt = Number(live.page ?? 0) * MESSENGER_LIST_PAGE_SIZE + (n - 1);
           if (Number.isInteger(n) && n >= 1 && n <= MESSENGER_LIST_PAGE_SIZE && live.indices[globalAt] !== undefined) {
-            return await messengerPickPlan(env, live.indices[globalAt]);
+            return await messengerPickPlan(env, live.indices[globalAt], senderId);
           }
         }
       }
@@ -652,7 +701,7 @@ export default {
         if (result.candidates.length === 1 || result.exactCount === 1 || sameWord) {
           const candidate = result.candidates[0];
           const record = records[candidate.row - 2];
-          return await messengerCardPlan(env, record, text, matchedPartIndex(record, normalized));
+          return await messengerCardPlan(env, record, text, matchedPartIndex(record, normalized), senderId);
         }
         const items = messengerOrderItems(
           result.candidates
@@ -679,10 +728,10 @@ export default {
       return { texts: [{ text: uiTextFor(text).noResult }], voiceUrl: null };
     }
 
-    async function messengerPickPlan(env, index) {
+    async function messengerPickPlan(env, index, senderId = null) {
       const record = records[index];
       if (!record) return { texts: [{ text: "لم أجد هذه الكلمة، ابحث عنها مرة أخرى." }], voiceUrl: null };
-      return await messengerCardPlan(env, record, "", -1);
+      return await messengerCardPlan(env, record, "", -1, senderId);
     }
 
     // Meta verification: GET /messenger-webhook?hub.mode=subscribe&
@@ -725,6 +774,28 @@ export default {
       // MESSENGER_ADMIN_PSID is the admin's page-scoped id, read from a
       // real admin message to the Page; unset, admin stays fail-closed.
       const macroConfig = await driveConfig(env).catch(() => null);
+      // Shared deps for the parity factory AND the dispatch commands
+      // (src/dispatch-commands.js): one adminStore, one user-record
+      // reader, one error list — the two modules must see the same DO
+      // state (suggestions, tickets, favorites, voice prefs).
+      const messengerAdminStore = {
+        get: async (key) => (await storeCall(env, { op: "get", key })).value ?? null,
+        put: async (key, value) => { await storeCall(env, { op: "put", key, value }); return true; },
+        del: async (key) => { await storeCall(env, { op: "put", key, value: null }); return true; },
+      };
+      const messengerGetUserRecord = async (psid) => {
+        // Messenger users live under `user:msgr:<PSID>`; a bare-PSID
+        // lookup would miss (or hit a Telegram user).
+        const record = await getUser(env, `msgr:${psid}`);
+        if (!record) return null;
+        return { record, history: await getUserHistory(env, `msgr:${psid}`) };
+      };
+      const messengerSaveUserRecord = async (psid, record) => saveUser(env, `msgr:${psid}`, record);
+      const messengerAdminPsids = String(env.MESSENGER_ADMIN_PSID ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+      const messengerListErrors = async () => {
+        const entries = env.USERS ? ((await storeCall(env, { op: "get", key: "errors:recent" }).catch(() => null))?.value ?? []) : [];
+        return (Array.isArray(entries) ? entries : []).slice(-30).reverse().map((e) => ({ at: e?.at ?? null, where: e?.where ?? e?.kind ?? "?", message: e?.message ?? String(e ?? "") }));
+      };
       const messengerParity = createMessengerParity({
         adminPsids: (env.MESSENGER_ADMIN_PSID ?? "").split(","),
         macroUrl: macroConfig?.url ?? null,
@@ -733,18 +804,8 @@ export default {
         loadState: (psid) => messengerParityLoadState(env, psid),
         saveState: (psid, next) => messengerParitySaveState(env, psid, next),
         isBanned: (psid) => isBanned(env, psid),
-        adminStore: {
-          get: async (key) => (await storeCall(env, { op: "get", key })).value ?? null,
-          put: async (key, value) => { await storeCall(env, { op: "put", key, value }); return true; },
-          del: async (key) => { await storeCall(env, { op: "put", key, value: null }); return true; },
-        },
-        getUserRecord: async (psid) => {
-          // Messenger users live under `user:msgr:<PSID>`; a bare-PSID
-          // lookup would miss (or hit a Telegram user).
-          const record = await getUser(env, `msgr:${psid}`);
-          if (!record) return null;
-          return { record, history: await getUserHistory(env, `msgr:${psid}`) };
-        },
+        adminStore: messengerAdminStore,
+        getUserRecord: messengerGetUserRecord,
         updateUserRecord: async (psid, patch) => {
           const u = (await getUser(env, `msgr:${psid}`)) ?? {};
           return saveUser(env, `msgr:${psid}`, { ...u, ...patch });
@@ -763,10 +824,7 @@ export default {
         listRecipients: () => messengerBroadcastRecipients(env),
         getStats: () => messengerParityStats(env),
         getUsage: () => messengerParityUsage(env),
-        listErrors: async () => {
-          const entries = env.USERS ? ((await storeCall(env, { op: "get", key: "errors:recent" }).catch(() => null))?.value ?? []) : [];
-          return (Array.isArray(entries) ? entries : []).slice(-30).reverse().map((e) => ({ at: e?.at ?? null, where: e?.where ?? e?.kind ?? "?", message: e?.message ?? String(e ?? "") }));
-        },
+        listErrors: messengerListErrors,
         listAuditLog: () => readAdminAudit(env),
         listSecurityLog: null, // no security-log reader exists on this path
         getDriveConfig: () => driveConfig(env).catch(() => null),
@@ -779,7 +837,29 @@ export default {
         getTicket: null,
         closeTicket: null,
         createTicket: null,
-        runUserCommand: null, // dispatch commands fall through to search
+        // Dispatch commands (wordinfo, /alphabet, /wod, voice prefs,
+        // favorites, ...) — the real handlers in src/dispatch-commands.js.
+        // Parked quiz/game commands answer with an honest "not built"
+        // message there; the "لم يتم توصيله بعد" placeholder only fires
+        // for a dispatch command that is somehow still unwired.
+        runUserCommand: createDispatchCommands({
+          getUserRecord: messengerGetUserRecord,
+          saveUserRecord: messengerSaveUserRecord,
+          clearHistory: (psid) => clearMessengerHistory(env, psid),
+          wordCard: (record, senderId) => messengerCardPlan(env, record, "", -1, senderId ?? null),
+          hasRecordedVoice: async (id) => {
+            try {
+              const overlay = await getRecordedOverlay(env);
+              return Boolean(recordedFilenameForId(id, overlay));
+            } catch {
+              return false;
+            }
+          },
+          adminStore: messengerAdminStore,
+          isAdmin: (psid) => messengerAdminPsids.includes(String(psid)),
+          firstAdminPsid: messengerAdminPsids[0] ?? null,
+          listErrors: messengerListErrors,
+        }),
         getDictAudit: () => messengerDictAudit(env),
         deleteVoice: null, // voice files live on the audio branch / DO
         // Voice recording (/record): Messenger voice attachments download
@@ -923,6 +1003,10 @@ export default {
           }
           const parity = await messengerParity.handleText(senderId, query);
           if (parity) return parity;
+          // Dictionary search fall-through: record it so /recent, /fav
+          // and /mystats have real data (recordMessengerSearch skips
+          // commands and never breaks the reply).
+          if (senderId != null) await recordMessengerSearch(env, senderId, query);
           return messengerSearchPlan(env, query, senderId);
         },
         pick: async (payload, senderId) => {
@@ -935,7 +1019,7 @@ export default {
           if (payload === MESSENGER_LIST_NAV_NEXT) return messengerListPagePlan(env, senderId, 1);
           if (payload === MESSENGER_LIST_NAV_PREV) return messengerListPagePlan(env, senderId, -1);
           const index = Number(payload);
-          return messengerPickPlan(env, index);
+          return messengerPickPlan(env, index, senderId);
         },
         // A voice message (audio attachment, no text): the /record flow
         // owns it when an admin session is open; anything else stays

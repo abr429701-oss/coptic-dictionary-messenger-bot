@@ -638,6 +638,50 @@ test("messenger voice is one upload with the word repeated 3 times inside, never
   }
 });
 
+// /voiceoff actually suppresses the voice: the word card goes out with
+// no audio upload at all (the pref lives on user:msgr:<PSID> and the
+// card plan reads it before resolving a voice URL).
+test("voiceoff preference suppresses the voice on a word card", async () => {
+  assert.ok(SINGLE, "expected a single-candidate voiced word in the dictionary");
+  const kv = fakeKv();
+  kv.store.set(`user:msgr:${SENDER_ID}`, { voiceOff: true });
+  const kvEnv = { ...env, USERS: kv };
+  const calls = [];
+  const restore = stubMessengerApi(calls);
+  try {
+    const response = await postSigned(messageEvent({ text: SINGLE.query }), kvEnv);
+    assert.equal(response.status, 200);
+    assert.equal(calls.length, 2, "typing_on + card text only — no audio upload");
+    assert.equal(calls[0].payload.sender_action, "typing_on");
+    assert.ok(calls[1].payload.message.text.length > 0, "the card text still goes out");
+  } finally {
+    restore();
+  }
+});
+
+// /voiceonce actually sends the file once: the uploaded OGG is the
+// original single-word file, byte-identical, not repeated 3×.
+test("voiceonce preference sends the voice file unrepeated (one copy inside)", async () => {
+  assert.ok(SINGLE, "expected a single-candidate voiced word in the dictionary");
+  const kv = fakeKv();
+  kv.store.set(`user:msgr:${SENDER_ID}`, { voiceRepeats: 1 });
+  const kvEnv = { ...env, USERS: kv };
+  const calls = [];
+  const restore = stubMessengerApi(calls);
+  try {
+    const response = await postSigned(messageEvent({ text: SINGLE.query }), kvEnv);
+    assert.equal(response.status, 200);
+    assert.equal(calls.length, 3, "typing_on + card text + exactly one audio upload");
+    const blob = calls[2].form.get("filedata");
+    const bytes = new Uint8Array(await blob.arrayBuffer());
+    const pages = parseOggPages(bytes);
+    assert.equal(pages.length, 4, "voiceonce: head + tags + 2 audio pages, no repeat, no gaps");
+    assert.deepEqual(bytes, VOICE_FIXTURE, "voiceonce: the uploaded bytes are the original single-word file");
+  } finally {
+    restore();
+  }
+});
+
 test("sendMessengerMessage returns Meta's attachment id", async () => {
   const realFetch = globalThis.fetch;
   globalThis.fetch = async () => Response.json({ recipient_id: SENDER_ID, message_id: "mid.1", attachment_id: "att-9" });

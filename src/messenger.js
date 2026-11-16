@@ -354,7 +354,7 @@ export async function sendMessengerAudioBytes(env, recipientId, audio, fetchImpl
 // the repeat is retried without the marker requirement. Anything that is
 // not a repeatable OGG (fetch failed, not OGG, unparseable) falls back to
 // ONE send of the original URL — the word once, never three messages.
-export async function sendWordVoice(env, senderId, voiceUrl, fetchImpl = globalThis.fetch) {
+export async function sendWordVoice(env, senderId, voiceUrl, fetchImpl = globalThis.fetch, repeats = MESSENGER_VOICE_REPEATS) {
   const fallback = () => sendMessengerMessage(env, senderId, messengerAudioMessage(voiceUrl), fetchImpl);
   try {
     const response = await fetchImpl(voiceUrl, { signal: AbortSignal.timeout(10000) });
@@ -362,9 +362,13 @@ export async function sendWordVoice(env, senderId, voiceUrl, fetchImpl = globalT
     const bytes = await response.arrayBuffer();
     if (!bytes || bytes.byteLength < 4) return fallback();
     if (new TextDecoder().decode(new Uint8Array(bytes, 0, 4)) !== "OggS") return fallback();
-    let repeated = repeatSingleWordOgg(bytes, { times: MESSENGER_VOICE_REPEATS, pauseMs: MESSENGER_VOICE_REPEAT_GAP_MS, requireMarker: true });
-    if (repeated === bytes) {
-      repeated = repeatSingleWordOgg(bytes, { times: MESSENGER_VOICE_REPEATS, pauseMs: MESSENGER_VOICE_REPEAT_GAP_MS, requireMarker: false });
+    // `repeats` is the user's voice-repeat preference (/voiceonce = 1,
+    // /voicethree = 3, default 3). repeats <= 1 returns the file
+    // untouched, so a recorded voice that already carries the word 3×
+    // natively is never repeated again.
+    let repeated = repeatSingleWordOgg(bytes, { times: repeats, pauseMs: MESSENGER_VOICE_REPEAT_GAP_MS, requireMarker: true });
+    if (repeated === bytes && repeats > 1) {
+      repeated = repeatSingleWordOgg(bytes, { times: repeats, pauseMs: MESSENGER_VOICE_REPEAT_GAP_MS, requireMarker: false });
     }
     const payload = repeated !== bytes ? repeated : bytes;
     const uploaded = await sendMessengerAudioBytes(env, senderId, { bytes: payload, contentType: "audio/ogg", fileName: "voice.ogg" }, fetchImpl);
@@ -381,7 +385,7 @@ export async function sendWordVoice(env, senderId, voiceUrl, fetchImpl = globalT
 // One messaging event. planFor.text(query, senderId, attachments) /
 // planFor.pick(indexOrPayload, senderId) /
 // planFor.audio(attachment, senderId) return a plan
-// { texts: [{ text, quickReplies }], voiceUrl, attachments?, photoBytes?, task? }
+// { texts: [{ text, quickReplies }], voiceUrl, voiceRepeats?, attachments?, photoBytes?, task? }
 // or null to stay silent. planFor.audio fires for an incoming audio
 // attachment (a Messenger voice message) when the message carries no
 // text or quick reply — the /record flow owns it. planFor.text also
@@ -451,7 +455,7 @@ export async function handleMessengerMessaging(env, event, planFor, fetchImpl = 
     if (result.ok) sent = true;
   }
   if (plan.voiceUrl) {
-    const result = await sendWordVoice(env, senderId, plan.voiceUrl, fetchImpl);
+    const result = await sendWordVoice(env, senderId, plan.voiceUrl, fetchImpl, plan.voiceRepeats ?? MESSENGER_VOICE_REPEATS);
     if (result.ok) sent = true;
   }
   if (plan.task && typeof planFor.executeTask === "function") {

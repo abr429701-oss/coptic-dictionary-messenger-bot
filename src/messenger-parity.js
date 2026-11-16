@@ -75,6 +75,7 @@ import {
   getCodePhoneValid,
 } from "./getcode.js";
 import { buildQuickReplies, plainTextCard } from "./messenger.js";
+import { PARKED_DISPATCH_MESSAGES } from "./dispatch-commands.js";
 import { listRecordedVoiceIds, recordedManifestFilename } from "./neural-voice.js";
 import {
   RECORDED_OVERLAY_KEY,
@@ -507,12 +508,18 @@ export function formatLiveForward({ name, psid, at, kind, text }) {
 //              owning agent's handler via the runUserCommand dep, for
 //              everyone, exactly as in Telegram. NOT admin-gated. When the
 //              dep is absent the module returns null so the owning agent's
-//              own planFor handles it.
+//              own planFor handles it. After the dispatch wiring
+//              (src/dispatch-commands.js, 2026-11-16) only the 12 parked
+//              quiz/game commands remain "dispatch": they are NOT built
+//              (user's decision 2026-11-13) and answer with an honest
+//              "not built" message from PARKED_DISPATCH_MESSAGES instead of
+//              the old "لم يتم توصيله بعد" placeholder. The other 44
+//              dispatch commands are now "impl".
 //   na       — inherently Telegram-only: listed explicitly with a reason,
 //              never silently dropped.
 //
-// Counts (see ADMIN_AUDIT / adminAuditCounts()): impl 201, dispatch 57,
-// na 76 = 334 (332 Telegram commands + 2 Messenger extras).
+// Counts (see ADMIN_AUDIT / adminAuditCounts()): impl 245, dispatch 12,
+// na 77 = 334 (332 Telegram commands + 2 Messenger extras).
 // ---------------------------------------------------------------------------
 
 export const ADMIN_CATEGORIES = [
@@ -622,6 +629,10 @@ export const ADMIN_NOT_APPLICABLE = {
   keyboard: "لوحة المفاتيح القبطية بلوحة أزرار تيليجرام — لا يوجد مقابل في ماسنجر",
   k: "اختصار لوحة المفاتيح القبطية في تيليجرام — لا يوجد مقابل في ماسنجر",
   kbd: "اختصار لوحة المفاتيح القبطية في تيليجرام — لا يوجد مقابل في ماسنجر",
+  // Main: language switching has no Messenger meaning — the interface is
+  // Arabic-only (Telegram /lang sets user.lang; nothing on Messenger
+  // reads a lang pref).
+  lang: "واجهة البوت عربي فقط على ماسنجر — لا يوجد تبديل لغة",
 };
 
 // User commands that sit in admin categories: they run through the
@@ -643,7 +654,9 @@ export const ADMIN_DISPATCH_COMMANDS = new Set([
   "toptop", "refinfo", "subscribe", "unsubscribe", "notify", "clearhistory",
   "alerts", "exitsupport",
   // Main user commands that live in the admin dashboard's first category.
-  "search", "random", "lang",
+  // /lang is NOT here: language switching has no Messenger meaning, so it
+  // lives in ADMIN_NOT_APPLICABLE instead.
+  "search", "random",
 ]);
 
 // The 2 Messenger extras beyond the 332 Telegram commands.
@@ -653,14 +666,21 @@ export const ADMIN_MESSENGER_EXTRAS = [
 ];
 
 // The full audit: one row per command. Status: impl | dispatch | na.
+// "dispatch" now means ONLY the 12 parked quiz/game commands: they
+// route through runUserCommand but answer with a parked message, so
+// they are not implemented. The other 44 commands that route through
+// runUserCommand are implemented (src/dispatch-commands.js) and count
+// as "impl"; /lang moved to "na".
 export const ADMIN_AUDIT = [
   ...ADMIN_CATEGORIES.flatMap((cat) => cat.commands.map((command) => {
     const status = ADMIN_NOT_APPLICABLE[command]
       ? "na"
-      : ADMIN_DISPATCH_COMMANDS.has(command) ? "dispatch" : "impl";
+      : ADMIN_DISPATCH_COMMANDS.has(command) && PARKED_DISPATCH_MESSAGES[command]
+        ? "dispatch"
+        : "impl";
     return {
       command, category: cat.id, categoryTitle: cat.title, status,
-      reason: ADMIN_NOT_APPLICABLE[command] ?? null,
+      reason: ADMIN_NOT_APPLICABLE[command] ?? PARKED_DISPATCH_MESSAGES[command] ?? null,
     };
   })),
   ...ADMIN_MESSENGER_EXTRAS.map((e) => ({ ...e, categoryTitle: "➕ إضافات ماسنجر" })),
@@ -691,10 +711,12 @@ export const ADMIN_UNGATED_IMPL = new Set([
 // Admin-gated commands: impl + na commands outside the "main" user
 // category (plus admin/dashboard themselves), minus the ungated impl
 // commands above. Dispatch commands and the parity user commands
-// (start/learn/menu/help/cancel/...) are NOT gated.
+// (start/learn/menu/help/cancel/...) are NOT gated — dispatch commands
+// run for everyone through runUserCommand even though they now count
+// as "impl" in the audit (src/dispatch-commands.js).
 export const ADMIN_COMMANDS = new Set(
   ADMIN_AUDIT
-    .filter((r) => (r.status === "impl" || r.status === "na") && r.category !== "main" && !ADMIN_UNGATED_IMPL.has(r.command))
+    .filter((r) => (r.status === "impl" || r.status === "na") && r.category !== "main" && !ADMIN_UNGATED_IMPL.has(r.command) && !ADMIN_DISPATCH_COMMANDS.has(r.command))
     .map((r) => r.command)
     .concat(["admin", "dashboard"]),
 );

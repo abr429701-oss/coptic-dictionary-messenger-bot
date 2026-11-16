@@ -73,6 +73,13 @@ settings, so no Meta settings change was needed for the split.
 - `src/messenger.js` — transport: signature verify, Send API, typing,
   quick replies, voice attachments.
 - `src/messenger-parity.js` — learn / certs / get-code / admin.
+- `src/dispatch-commands.js` — the 57 dispatch commands that sit in
+  admin categories (dictionary features, voice prefs, favorites, WOD,
+  support): 44 implemented, 12 quiz/game commands parked by the user's
+  decision (honest "not built" message), /lang answered as not
+  applicable (Arabic-only interface). Search history is now recorded
+  (`history:msgr:<PSID>`, cap 20) so /recent, /fav and /mystats have
+  real data.
 - `src/record-voice.js` — `/record` pure helpers (prompt, file names,
   next-unrecorded-word, manifest + DO overlay merge, MP3-sibling
   preference). `src/neural-voice.js` resolves playback through the
