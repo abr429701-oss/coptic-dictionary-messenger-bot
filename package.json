@@ -1,0 +1,13 @@
+{
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  },
+  "name": "coptic-dictionary-messenger-bot",
+  "private": true,
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "sync": "node scripts/sync-data-from-telegram.mjs",
+    "test": "node --test"
+  },
+  "type": "module"
+}

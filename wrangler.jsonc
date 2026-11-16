@@ -1,0 +1,18 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "coptic-dictionary-messenger-bot",
+  "main": "src/index.js",
+  "compatibility_date": "2026-10-02",
+  "workers_dev": true,
+  // Keep-warm: a no-op scheduled tick every 5 minutes (see scheduled() in
+  // src/index.js) so the first webhook after idle does not pay a cold start.
+  "triggers": { "crons": ["*/5 * * * *"] },
+  "vars": { "HUMAN_AUDIO": "on" },
+  "durable_objects": {
+    "bindings": [{ "name": "USERS", "class_name": "UserStore" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["UserStore"] }],
+  "observability": {
+    "enabled": true
+  }
+}

@@ -1,0 +1,109 @@
+name: Deploy Coptic Dictionary Messenger Bot
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: deploy-messenger
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    # Every push to main is deployed automatically; the 30-minute schedule
+    # mirrors the Telegram bot's data (dictionary + learn manifest) so a
+    # Sheet edit lands here within ~60 minutes. Deploy only when something
+    # actually changed.
+    runs-on: ubuntu-latest
+    outputs:
+      deploy: ${{ steps.decide.outputs.deploy }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # The Telegram repo is public, so this needs no token. It pulls the
+      # derived files only — the Sheet is read (and the manifest built) in
+      # the Telegram repo, never here.
+      - name: Sync data from the Telegram bot repo
+        run: node scripts/sync-data-from-telegram.mjs
+
+      - name: Commit data if they changed
+        id: commit
+        run: |
+          git add -A data src/learn-manifest.js
+          if git diff --cached --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -m "Sync data from Telegram bot"
+            git push
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Decide whether to deploy
+        id: decide
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ] && [ "${{ steps.commit.outputs.changed }}" != "true" ]; then
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+            echo "Data unchanged; nothing to deploy."
+          else
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  deploy:
+    needs: sync
+    if: ${{ needs.sync.outputs.deploy == 'true' }}
+    runs-on: ubuntu-latest
+    env:
+CLOUDFLARE_API_TOKEN: <redacted>
+      CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - name: Check out repository (latest main)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Validate required secrets and variables
+        run: |
+          for key in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID; do
+            if [ -z "${!key}" ]; then echo "Missing GitHub secret/variable: $key"; exit 1; fi
+          done
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+      - name: Deploy Worker and detect its URL
+        run: |
+          set -o pipefail
+          if ! npx wrangler deploy 2>&1 | tee /tmp/wrangler-deploy.log; then
+            echo "::error title=wrangler deploy failed::$(sed 's/\x1b\[[0-9;]*[A-Za-z]//g' /tmp/wrangler-deploy.log | tail -30 | tr '\n' ' ' | cut -c1-1500)"
+            exit 1
+          fi
+          clean_log="$(sed 's/\x1b\[[0-9;]*[A-Za-z]//g' /tmp/wrangler-deploy.log)"
+          worker_url="$(printf '%s' "$clean_log" | grep -Eo 'https://[A-Za-z0-9.-]+\.workers\.dev' | tail -n 1 || true)"
+          if [ -z "$worker_url" ]; then
+            worker_url="https://coptic-dictionary-messenger-bot.abr429701.workers.dev"
+            echo "Could not detect URL from wrangler output; using fallback $worker_url"
+          fi
+          echo "WORKER_URL=$worker_url" >> "$GITHUB_ENV"
