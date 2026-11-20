@@ -134,7 +134,7 @@ async function recordedMp3Exists(env, base, filename, fetchImpl = globalThis.fet
 
 // Overlay-aware voice URL for one record: recorded (overlay > manifest,
 // .mp3 sibling preferred when the converter produced it), then the
-// prebuilt audio-manifest voice, then Joanna. Null when the word has no
+// prebuilt audio-manifest voice. Null when the word has no
 // voice at all.
 async function resolveMessengerVoice(env, record, fetchImpl = globalThis.fetch) {
   if (!record || record.id == null) return null;
@@ -550,8 +550,8 @@ export default {
 
     // One word card as plain text, plus its voice URL when the word has
     // one (null when it does not — the voice step is then skipped). Voice
-    // priority is Telegram's: recorded human first, then prebuilt Polly,
-    // then Joanna (see messengerVoiceUrl in neural-voice.js). The ×3
+    // priority is Telegram's: recorded human first, then prebuilt Polly
+    // (see messengerVoiceUrl in neural-voice.js). The ×3
     // repeat in the transport applies to whichever voice is served, and
     // the user's voice prefs on `user:msgr:<PSID>` are honored here:
     // voiceOff suppresses the voice entirely, voiceRepeats 1 sends the

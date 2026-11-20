@@ -8,7 +8,6 @@
   // src/index.js) so the first webhook after idle does not pay a cold start.
   "triggers": { "crons": ["*/5 * * * *"] },
   "vars": {
-    "HUMAN_AUDIO": "on",
     // Public base for recorded voices (/record): the recorded/ prefix of
     // the same R2 bucket the lesson media uses. A var, not a secret —
     // it is a public URL. Without it, recorded voices fall back to the

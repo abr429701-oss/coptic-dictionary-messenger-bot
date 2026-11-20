@@ -18,7 +18,7 @@ import {
   MESSENGER_PICK_PREFIX,
   MESSENGER_SEND_URL,
 } from "../src/messenger.js";
-import { prebuiltAudioUrl, messengerVoiceUrl, messengerVoiceUrlWithOverlay, recordedAudioUrl, humanAudioUrl } from "../src/neural-voice.js";
+import { prebuiltAudioUrl, messengerVoiceUrl, messengerVoiceUrlWithOverlay, recordedAudioUrl } from "../src/neural-voice.js";
 import { oggCrc, parseOggPages } from "../src/ogg-repeat.js";
 import records from "../data/dictionary.json" with { type: "json" };
 import audioManifest from "../data/audio-manifest.json" with { type: "json" };
@@ -743,7 +743,7 @@ test("messenger plan failure turns typing off and stays silent", async () => {
   assert.ok(calls.every((c) => c.payload.message === undefined));
 });
 
-test("messengerVoiceUrl priority: recorded human, then prebuilt, then Joanna, then none", () => {
+test("messengerVoiceUrl priority: recorded human, then prebuilt, then none", () => {
   const recordedBase = "https://example.invalid/recorded";
   const rec55 = records.find((r) => String(r.id) === "55");
   const rec25344 = records.find((r) => String(r.id) === "25344");
@@ -759,11 +759,8 @@ test("messengerVoiceUrl priority: recorded human, then prebuilt, then Joanna, th
   // A word with no recording falls back to prebuilt.
   assert.ok(!Object.hasOwn({ 55: 1, 25344: 1 }, String(SINGLE.record.id)));
   assert.equal(messengerVoiceUrl(env, SINGLE.record), prebuiltAudioUrl(env, SINGLE.record.id));
-  // Joanna is the last tier, only with HUMAN_AUDIO on and no prebuilt
-  // file; without the flag there is no voice at all for such an id.
+  // A word with no recording and no prebuilt file has no voice at all.
   const ghost = { id: 999999999 };
-  assert.equal(messengerVoiceUrl({ ...env, HUMAN_AUDIO: "on" }, ghost), humanAudioUrl({ ...env, HUMAN_AUDIO: "on" }, 999999999));
-  assert.ok(messengerVoiceUrl({ ...env, HUMAN_AUDIO: "on" }, ghost).includes("audio-human/999999999.ogg"));
   assert.equal(messengerVoiceUrl(env, ghost), null);
   // A record with no id has no voice.
   const noId = records.find((r) => r.id == null);
