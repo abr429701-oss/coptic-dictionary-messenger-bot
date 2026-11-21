@@ -8,8 +8,10 @@
 // get-code and admin are the same code the Telegram bot runs; the
 // Telegram-only routes and modules were left behind (see README.md).
 //
-// Routes: GET / (ready text), GET /health, GET+POST /messenger-webhook.
-// Everything else is 404. The learn web app and privacy page still live
+// Routes: GET / (ready text), GET /health, GET+POST /messenger-webhook,
+// POST /botcake (Botcake flow → brain: same planFor, but the reply comes
+// back as a flat JSON envelope instead of being sent). Everything else
+// is 404. The learn web app and privacy page still live
 // on the Telegram Worker.
 
 import records from "../data/dictionary.json" with { type: "json" };
@@ -26,6 +28,9 @@ import {
   plainTextCard,
   buildQuickReplies,
   sendMessengerMessage,
+  sendMessengerPhotoBytes,
+  sendWordVoice,
+  messengerAttachmentMessage,
   messengerTextMessage,
   MESSENGER_PICK_PREFIX,
 } from "./messenger.js";
@@ -181,6 +186,153 @@ async function clearMessengerHistory(env, psid) {
   } catch {
     return false;
   }
+}
+
+// -- Botcake envelope -------------------------------------------------------
+// The flat JSON contract the Botcake flow maps to variables (one JSON path
+// → one variable, so the envelope is scalar fields only, no nested arrays):
+// text/text2/text3 = the plan's text chunks in order (plans with more than
+// three chunks join the rest into text3), voice_url = the word voice,
+// image_url = the first IMAGE attachment, video_url = the first VIDEO
+// attachment (lesson media: the flow has separate Image and Video steps —
+// a video URL in image_url would be sent as the wrong type), quick_replies
+// = a JSON string of [{title, payload}] taken from the LAST text that
+// carries them (empty when the plan has none — the user then picks by
+// typing a number, which the brain already supports). action is "none" on
+// a normal reply.
+// Botcake's flow text step silently drops a message whose text is too long
+// (verified live 21 Nov: the 14-item L2 lesson list, ~324 chars, arrives;
+// the 21-item L1 list, ~600+ chars, never does, while the brain returns it
+// with hasText=true). The exact limit is unknown, so split any single text
+// longer than 320 chars into chunks of at most 300 chars on line boundaries;
+// the flow already sends text/text2/text3 in order, so a split list still
+// arrives whole and the user still picks by number.
+const BOTCAKE_SPLIT_AT = 320;
+const BOTCAKE_CHUNK_MAX = 300;
+
+function splitBotcakeText(value) {
+  const text = typeof value === "string" ? value : "";
+  if (text.length <= BOTCAKE_SPLIT_AT) return [text];
+  // Break every line into <=CHUNK pieces first (a single very long line is
+  // hard-split), then greedily pack lines into chunks.
+  const pieces = [];
+  for (const line of text.split("\n")) {
+    let rest = line;
+    while (rest.length > BOTCAKE_CHUNK_MAX) {
+      pieces.push(rest.slice(0, BOTCAKE_CHUNK_MAX));
+      rest = rest.slice(BOTCAKE_CHUNK_MAX);
+    }
+    pieces.push(rest);
+  }
+  const chunks = [];
+  let current = "";
+  for (const piece of pieces) {
+    const next = current ? current + "\n" + piece : piece;
+    if (next.length <= BOTCAKE_CHUNK_MAX) {
+      current = next;
+    } else {
+      if (current) chunks.push(current);
+      current = piece;
+    }
+  }
+  if (current) chunks.push(current);
+  return chunks.filter(Boolean);
+}
+
+export function planToBotcakeEnvelope(plan) {
+  const rawTexts = Array.isArray(plan?.texts) ? plan.texts : [];
+  const asText = (value) => (typeof value === "string" ? value : "");
+  // Expand any over-long text into <=CHUNK pieces. Quick replies ride on
+  // the last piece of the text that carried them.
+  const texts = [];
+  for (const item of rawTexts) {
+    const pieces = splitBotcakeText(asText(item?.text));
+    pieces.forEach((piece, i) => {
+      texts.push({
+        text: piece,
+        quickReplies: i === pieces.length - 1 ? item?.quickReplies : undefined,
+      });
+    });
+  }
+  const lastWithReplies = [...texts]
+    .reverse()
+    .find((item) => Array.isArray(item?.quickReplies) && item.quickReplies.length);
+  const quickReplies = lastWithReplies
+    ? lastWithReplies.quickReplies
+        .map((q) => ({ title: String(q?.title ?? ""), payload: String(q?.payload ?? "") }))
+        .filter((q) => q.title && q.payload)
+    : [];
+  const imageUrl = Array.isArray(plan?.attachments)
+    ? (plan.attachments.find((a) => a?.url && a?.type !== "video")?.url ?? "")
+    : "";
+  const videoUrl = Array.isArray(plan?.attachments)
+    ? (plan.attachments.find((a) => a?.url && a?.type === "video")?.url ?? "")
+    : "";
+  const text = asText(texts[0]?.text);
+  const text2 = asText(texts[1]?.text);
+  let text3 = texts.slice(2).map((item) => asText(item?.text)).filter(Boolean).join("\n\n");
+  // The flow has only three text slots; if the split produced more, cap
+  // text3 so it too stays under the limit (real replies fit in three).
+  if (text3.length > BOTCAKE_CHUNK_MAX) text3 = text3.slice(0, BOTCAKE_CHUNK_MAX) + "…";
+  const voiceUrl = typeof plan?.voiceUrl === "string" ? plan.voiceUrl : "";
+  return {
+    text,
+    text2,
+    text3,
+    voice_url: voiceUrl,
+    image_url: typeof imageUrl === "string" ? imageUrl : "",
+    video_url: typeof videoUrl === "string" ? videoUrl : "",
+    quick_replies: quickReplies.length ? JSON.stringify(quickReplies) : "",
+    // Flags for the Botcake flow's Conditions: Botcake converts "" to the
+    // literal "null" on save, and its "not equals" operator does not work
+    // live, so the flow gates on these always-real "yes"/"no" strings with
+    // a single "equals yes" rule instead of comparing the content fields.
+    has_text: text ? "yes" : "no",
+    has_text2: text2 ? "yes" : "no",
+    has_text3: text3 ? "yes" : "no",
+    has_image: imageUrl ? "yes" : "no",
+    // 21 Nov 2026: lesson order fix — the flow delays the image/text for
+    // video lessons (a conditional Smart Delay gated on has_video) so the
+    // video (slow Meta upload, ~17s) arrives BEFORE the photo, matching
+    // Telegram's manifest order (video → photo → text). Without this the
+    // photo/text (flow, ~10s) arrive before the video.
+    has_video: videoUrl ? "yes" : "no",
+    action: "none",
+  };
+}
+
+// -- Botcake input ----------------------------------------------------------
+// The flow's JSON API block sends the subscriber id + message text (and a
+// quick-reply payload when the user taps one). The exact variable names are
+// Botcake's, so accept every plausible name — Phase 0 confirms which ones
+// the block actually sends. Query params are a fallback when the body is
+// empty or not JSON.
+export function parseBotcakeInput(body, url) {
+  const b = body && typeof body === "object" ? body : {};
+  const q = url?.searchParams;
+  const pick = (...keys) => {
+    for (const key of keys) {
+      const value = b[key];
+      if (value !== undefined && value !== null && String(value) !== "") return String(value);
+    }
+    return "";
+  };
+  const psid =
+    pick("psid", "sender_id", "subscriber_id", "user_id", "from", "senderId") ||
+    (q?.get("psid") ?? "");
+  const text =
+    pick("text", "message", "message_text", "last_message", "input", "user_message") ||
+    (q?.get("text") ?? "");
+  const payload =
+    pick("payload", "quick_reply_payload", "postback_payload") || (q?.get("payload") ?? "");
+  const conversationId =
+    pick("conversation_id", "conversationId") || (q?.get("conversation_id") ?? "");
+  return {
+    psid: psid || null,
+    text,
+    payload: payload || null,
+    conversationId: conversationId || null,
+  };
 }
 
 export default {
@@ -747,32 +899,13 @@ export default {
       }
       return new Response(challenge, { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
     }
-    if (url.pathname === "/messenger-webhook" && request.method === "POST") {
-      if (!env.MESSENGER_APP_SECRET || !env.MESSENGER_PAGE_TOKEN) {
-        return new Response("Forbidden", { status: 403 });
-      }
-      // The signature covers the raw body, so read it once as text and
-      // parse the same bytes — request.json() would hide the raw form.
-      let rawBody;
-      try {
-        rawBody = await request.text();
-      } catch {
-        return new Response("Bad request", { status: 400 });
-      }
-      const signatureOk = await verifyMessengerSignature(rawBody, request.headers.get("x-hub-signature-256"), env.MESSENGER_APP_SECRET);
-      if (!signatureOk) return new Response("Forbidden", { status: 403 });
-      let body;
-      try {
-        body = JSON.parse(rawBody);
-      } catch {
-        return new Response("Bad request", { status: 400 });
-      }
-      if (body?.object !== "page") return new Response("EVENT_RECEIVED", { status: 200 });
-      // Parity (learn / certs / get-code / admin) answers first; the
-      // dictionary search is the fall-through. The parity handler is
-      // built per request (cheap factory) so it closes over this env.
-      // MESSENGER_ADMIN_PSID is the admin's page-scoped id, read from a
-      // real admin message to the Page; unset, admin stays fail-closed.
+    // -- One brain, two transports ----------------------------------------
+    // The webhook and POST /botcake share this wiring (parity brain +
+    // live-monitor hook + planFor). Built lazily per request so the GET
+    // routes never pay the drive-config read.
+    let planForCache = null;
+    async function getPlanFor() {
+      if (planForCache) return planForCache;
       const macroConfig = await driveConfig(env).catch(() => null);
       // Shared deps for the parity factory AND the dispatch commands
       // (src/dispatch-commands.js): one adminStore, one user-record
@@ -1033,6 +1166,179 @@ export default {
         },
         executeTask: (task, senderId, fetchImpl) => executeMessengerTask(env, task, senderId, fetchImpl, { ctx }),
       };
+      planForCache = planFor;
+      return planForCache;
+    }
+
+    // Botcake brain endpoint: POST /botcake -------------------------------
+    // Auth: shared secret in the X-Botcake-Secret header, compared against
+    // env.BOTCAKE_SECRET; fail-closed (unset secret = always 403) so the
+    // route cannot be used before the secret exists. The Botcake JSON API
+    // block sends the header; the secret never appears in a URL or a flow.
+    // The flow sends { psid, text } (or a quick-reply payload); the same
+    // brain computes the reply, but nothing is sent here — the plan comes
+    // back as a flat JSON envelope (planToBotcakeEnvelope) and Botcake
+    // sends it. Server-side tasks (admin DM, broadcasts, ...) still run
+    // here, exactly as on the webhook path.
+    if (url.pathname === "/botcake" && request.method === "POST") {
+      if (!env.BOTCAKE_SECRET || !sameSecret(request.headers.get("x-botcake-secret") ?? "", env.BOTCAKE_SECRET)) {
+        return new Response("Forbidden", { status: 403 });
+      }
+      let body = null;
+      try {
+        body = await request.json();
+      } catch {
+        body = null;
+      }
+      const input = parseBotcakeInput(body, url);
+      if (!input.psid) {
+        return Response.json({ error: "missing_psid" }, { status: 400 });
+      }
+      const started = Date.now();
+      const planFor = await getPlanFor();
+      // Typing indicator, best-effort: the user sees "يكتب..." while the
+      // flow waits for this call. A failure never blocks the reply; the
+      // flow's reply clears it, and a silent turn turns it off below.
+      try {
+        await sendMessengerSenderAction(env, input.psid, "typing_on");
+      } catch {
+        /* typing is best-effort only */
+      }
+      let plan = null;
+      try {
+        if (input.payload) plan = await planFor.pick(input.payload, input.psid);
+        else plan = await planFor.text(input.text, input.psid, null);
+      } catch (error) {
+        console.error("Botcake plan failed", error instanceof Error ? error.message : "unknown");
+        try {
+          await sendMessengerSenderAction(env, input.psid, "typing_off");
+        } catch {
+          /* typing is best-effort only */
+        }
+        return Response.json({
+          text: "حصلت مشكلة، حاول تاني بعد شوية.",
+          text2: "",
+          text3: "",
+          voice_url: "",
+          image_url: "",
+          video_url: "",
+          quick_replies: "",
+          action: "error",
+        });
+      }
+      if (plan?.task && typeof planFor.executeTask === "function") {
+        try {
+          await planFor.executeTask(plan.task, input.psid);
+        } catch (error) {
+          console.error("Botcake task failed", error instanceof Error ? error.message : "unknown");
+        }
+      }
+      const envelope = planToBotcakeEnvelope(plan);
+      // Voice cannot be sent from a Botcake flow: the Audio step is
+      // upload-only (no URL, no variable — Phase 0, 21 Nov 2026), so the
+      // Worker sends the voice itself, delayed ~3 s so the flow's text
+      // lands first (text before voice, the WhatsApp port's proven
+      // order). Best-effort in waitUntil so the envelope is not delayed;
+      // a failed send never blocks the reply, and the text card still
+      // arrives when Meta's send restriction is up.
+      if (plan?.voiceUrl && ctx?.waitUntil) {
+        const voiceUrl = plan.voiceUrl;
+        const repeats = plan.voiceRepeats ?? 3;
+        ctx.waitUntil((async () => {
+          await new Promise((resolve) => setTimeout(resolve, 3000));
+          try {
+            await sendWordVoice(env, input.psid, voiceUrl, globalThis.fetch, repeats);
+          } catch (error) {
+            console.error("Botcake voice send failed", error instanceof Error ? error.message : "unknown");
+          }
+        })());
+      }
+      // Video cannot be sent from a Botcake flow either: the Video step
+      // takes a static URL or an upload — no variable (checked live
+      // 21 Nov 2026: typing {{video_url}} is rejected as an invalid URL).
+      // So the Worker sends the lesson video itself. 21 Nov 2026 (lesson
+      // order fix): the send is AWAITED, not waitUntil — a lesson video
+      // upload takes 17–30 s (Meta fetching + processing), and the flow's
+      // photo/text (even with the 15 s conditional delay) can beat it, so
+      // the lesson arrived text-first. Awaiting the video makes the
+      // envelope return only after the video is sent, so the flow's
+      // photo/text always land AFTER the video — Telegram's order
+      // (video → photo → text). A failed send never blocks the reply.
+      const videoAttachment = Array.isArray(plan?.attachments)
+        ? plan.attachments.find((a) => a?.type === "video" && a?.url)
+        : null;
+      if (videoAttachment) {
+        const videoUrl = videoAttachment.url;
+        try {
+          await sendMessengerMessage(env, input.psid, messengerAttachmentMessage("video", videoUrl), globalThis.fetch);
+        } catch (error) {
+          console.error("Botcake video send failed", error instanceof Error ? error.message : "unknown");
+        }
+      }
+      // Certificates: a ready certificate arrives as BYTES (photoBytes),
+      // not a URL — lookupCertificate downloads the image, and
+      // certResultToPlan carries it as plan.photoBytes. The envelope only
+      // maps plan.attachments (URLs) to image_url, so photoBytes was
+      // silently dropped and only the caption text ever arrived — the
+      // certificate itself was never sent (reported 21 Nov 2026). Send it
+      // here, AWAITED like the video, so it lands before the flow's
+      // caption text — the webhook order (photoBytes before texts). A
+      // failed send never blocks the reply.
+      if (plan?.photoBytes) {
+        try {
+          const photoResult = await sendMessengerPhotoBytes(env, input.psid, plan.photoBytes, globalThis.fetch);
+          if (!photoResult.ok) {
+            console.error("Botcake certificate photo send failed", photoResult.error ?? "unknown");
+          }
+        } catch (error) {
+          console.error("Botcake certificate photo send failed", error instanceof Error ? error.message : "unknown");
+        }
+      }
+      if (!envelope.text && !envelope.voice_url && !envelope.image_url && !envelope.video_url) {
+        try {
+          await sendMessengerSenderAction(env, input.psid, "typing_off");
+        } catch {
+          /* typing is best-effort only */
+        }
+      }
+      console.log("botcake", JSON.stringify({
+        psid: input.psid,
+        ms: Date.now() - started,
+        hasText: Boolean(envelope.text),
+        hasVoice: Boolean(envelope.voice_url),
+        hasImage: Boolean(envelope.image_url),
+        hasVideo: Boolean(envelope.video_url),
+      }));
+      return Response.json(envelope);
+    }
+
+    if (url.pathname === "/messenger-webhook" && request.method === "POST") {
+      if (!env.MESSENGER_APP_SECRET || !env.MESSENGER_PAGE_TOKEN) {
+        return new Response("Forbidden", { status: 403 });
+      }
+      // The signature covers the raw body, so read it once as text and
+      // parse the same bytes — request.json() would hide the raw form.
+      let rawBody;
+      try {
+        rawBody = await request.text();
+      } catch {
+        return new Response("Bad request", { status: 400 });
+      }
+      const signatureOk = await verifyMessengerSignature(rawBody, request.headers.get("x-hub-signature-256"), env.MESSENGER_APP_SECRET);
+      if (!signatureOk) return new Response("Forbidden", { status: 403 });
+      let body;
+      try {
+        body = JSON.parse(rawBody);
+      } catch {
+        return new Response("Bad request", { status: 400 });
+      }
+      if (body?.object !== "page") return new Response("EVENT_RECEIVED", { status: 200 });
+      // Parity (learn / certs / get-code / admin) answers first; the
+      // dictionary search is the fall-through. The parity handler is
+      // built per request (cheap factory) so it closes over this env.
+      // MESSENGER_ADMIN_PSID is the admin's page-scoped id, read from a
+      // real admin message to the Page; unset, admin stays fail-closed.
+      const planFor = await getPlanFor();
       // Fast-ack like the Telegram webhook: answer Meta 200 immediately and
       // keep processing in the background (Meta re-delivers after ~20s).
       // Tests call fetch without a Workers ctx, so there we still await to
