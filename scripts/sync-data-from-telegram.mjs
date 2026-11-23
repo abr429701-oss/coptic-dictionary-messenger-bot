@@ -37,19 +37,45 @@ const FILES = [
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 
+// Transient GitHub blips (HTTP 503/429/5xx, network resets) used to fail the
+// whole sync even though the next run succeeded. Retry each file a few times
+// with backoff before giving up, so one brief GitHub hiccup no longer
+// produces a SYNC FAIL.
+const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504]);
+const MAX_ATTEMPTS = 4; // 1 try + 3 retries
+const RETRY_DELAYS_MS = [2000, 5000, 10000];
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+async function fetchWithRetry(url, rel) {
+  let lastError = null;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(60000) });
+      if (res.ok) return res;
+      lastError = new Error(`HTTP ${res.status}`);
+      if (!RETRYABLE_STATUS.has(res.status) || attempt === MAX_ATTEMPTS) {
+        console.error(`sync: ${rel} -> HTTP ${res.status} (attempt ${attempt}/${MAX_ATTEMPTS})`);
+        return null;
+      }
+      console.error(`sync: ${rel} -> HTTP ${res.status} (attempt ${attempt}/${MAX_ATTEMPTS}); retrying in ${RETRY_DELAYS_MS[attempt - 1] / 1000}s`);
+    } catch (error) {
+      lastError = error;
+      if (attempt === MAX_ATTEMPTS) {
+        console.error(`sync: fetch failed for ${rel}: ${error instanceof Error ? error.message : "unknown"} (attempt ${attempt}/${MAX_ATTEMPTS})`);
+        return null;
+      }
+      console.error(`sync: fetch failed for ${rel}: ${error instanceof Error ? error.message : "unknown"} (attempt ${attempt}/${MAX_ATTEMPTS}); retrying in ${RETRY_DELAYS_MS[attempt - 1] / 1000}s`);
+    }
+    await sleep(RETRY_DELAYS_MS[attempt - 1]);
+  }
+  console.error(`sync: ${rel} failed after ${MAX_ATTEMPTS} attempts: ${lastError instanceof Error ? lastError.message : "unknown"}`);
+  return null;
+}
+
 let failed = false;
 for (const rel of FILES) {
   const url = `${BASE}/${rel}`;
-  let res;
-  try {
-    res = await fetch(url, { signal: AbortSignal.timeout(60000) });
-  } catch (error) {
-    console.error(`sync: fetch failed for ${rel}: ${error instanceof Error ? error.message : "unknown"}`);
-    failed = true;
-    continue;
-  }
-  if (!res.ok) {
-    console.error(`sync: ${rel} -> HTTP ${res.status}`);
+  const res = await fetchWithRetry(url, rel);
+  if (!res) {
     failed = true;
     continue;
   }
