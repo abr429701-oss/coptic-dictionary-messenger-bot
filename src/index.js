@@ -1519,6 +1519,68 @@ export default {
           console.error("Botcake first-user direct send failed", error instanceof Error ? error.message : "unknown");
         }
       }
+      // Word cards: send the card text directly (awaited), like the voice
+      // below. Live bug 23 Nov 2026: picking a suggestion returns only
+      // the voice — the flow drops the card text on pick turns (it reads
+      // its saved reply fields one run stale), while the voice, sent
+      // directly by the Worker, always arrives. Sending the text directly
+      // too makes the card complete (meaning, kind, origin). On success
+      // the envelope text is cleared so the flow sends nothing (no
+      // double); a chunk that fails to send stays in the envelope so the
+      // flow tries it as a fallback. Skipped for first-ever users (the
+      // direct send above already delivered their text), and the name
+      // gate prompt is not a word card (no wordCard flag), so a brand-new
+      // user still gets FIRST_TIME_TEXT first. The card carries no quick
+      // replies in the plan, so the five fixed navigation buttons from
+      // the flow's Content #7 are attached here (label as payload, so a
+      // tap arrives as the label and maps to its command).
+      if (plan?.wordCard && envelope.text && !isFirstEver) {
+        try {
+          let quickReplies = [];
+          try {
+            const parsed = envelope.quick_replies ? JSON.parse(envelope.quick_replies) : [];
+            if (Array.isArray(parsed)) quickReplies = parsed;
+          } catch {
+            /* no quick replies in the envelope */
+          }
+          if (!quickReplies.length) {
+            quickReplies = ["البداية", "تعلّم", "القائمة", "كلمة عشوائية", "تواصل معنا"].map((title) => ({
+              title,
+              payload: title,
+            }));
+          }
+          const chunks = [envelope.text, envelope.text2, envelope.text3].filter(Boolean);
+          let sentCount = 0;
+          for (let i = 0; i < chunks.length; i++) {
+            const isLast = i === chunks.length - 1;
+            const msg = { text: chunks[i] };
+            if (isLast && quickReplies.length) {
+              msg.quick_replies = quickReplies.map((q) => ({
+                content_type: "text",
+                title: String(q.title ?? "").slice(0, 20),
+                payload: String(q.payload ?? ""),
+              }));
+            }
+            const sent = await sendMessengerMessage(env, input.psid, msg, globalThis.fetch);
+            if (!sent.ok) {
+              console.error("Botcake word-card direct send failed", sent.error ?? "unknown");
+              break;
+            }
+            sentCount++;
+          }
+          // Clear only the chunks that landed, so the flow does not
+          // resend them; a failed chunk stays in the envelope.
+          if (sentCount > 0) envelope.text = "";
+          if (sentCount > 1) envelope.text2 = "";
+          if (sentCount > 2) envelope.text3 = "";
+          if (sentCount > 0) envelope.has_text = "no";
+          if (sentCount > 1) envelope.has_text2 = "no";
+          if (sentCount > 2) envelope.has_text3 = "no";
+          if (sentCount === chunks.length) envelope.quick_replies = "";
+        } catch (error) {
+          console.error("Botcake word-card direct send failed", error instanceof Error ? error.message : "unknown");
+        }
+      }
       // Voice cannot be sent from a Botcake flow: the Audio step is
       // upload-only (no URL, no variable — Phase 0, 21 Nov 2026), so the
       // Worker sends the voice itself, delayed ~3 s so the flow's text

@@ -87,6 +87,16 @@ function seedNamedUser(kv, psid = SENDER_ID) {
   kv.store.set(`user:msgr:${psid}`, { name: "Ebram" });
 }
 
+// Text the Worker sent directly via the Send API (word cards go out
+// directly now — the Botcake flow drops the card text on pick turns —
+// so the card lives here, not in the envelope).
+function directText(calls) {
+  return calls
+    .filter((c) => c.url === MESSENGER_SEND_URL && typeof c.body?.message?.text === "string")
+    .map((c) => c.body.message.text)
+    .join("\n");
+}
+
 // --- sendMessengerReaction ------------------------------------------------
 
 test("reaction: posts LOVE to the message reactions edge with the Page token", async () => {
@@ -252,7 +262,11 @@ test("botcake: /random with a message id reacts (word card)", async () => {
   seedNamedUser(kv);
   const calls = [];
   const { envelope } = await postBotcake({ psid: SENDER_ID, text: "/random", message_id: MID }, kv, calls);
-  assert.ok(envelope.text.includes("الكلمة:"), "a word card came back");
+  // Word cards are sent directly by the Worker now (the Botcake flow
+  // drops the card text on pick turns) — the envelope text is cleared
+  // and the card arrives via the direct send.
+  assert.equal(envelope.text, "", "envelope text cleared for a word card");
+  assert.ok(directText(calls).includes("الكلمة:"), "a word card came back via direct send");
   const reaction = calls.find((c) => c.url === REACTIONS_URL);
   assert.ok(reaction, "a reactions call was made for /random");
   assert.deepEqual(reaction.body, { reaction: "LOVE" });
@@ -263,7 +277,8 @@ test("botcake: /wod with a message id reacts (word card)", async () => {
   seedNamedUser(kv);
   const calls = [];
   const { envelope } = await postBotcake({ psid: SENDER_ID, text: "/wod", message_id: MID }, kv, calls);
-  assert.ok(envelope.text.includes("الكلمة:"), "a word card came back");
+  assert.equal(envelope.text, "", "envelope text cleared for a word card");
+  assert.ok(directText(calls).includes("الكلمة:"), "a word card came back via direct send");
   assert.ok(calls.some((c) => c.url === REACTIONS_URL), "a reactions call was made for /wod");
 });
 
@@ -276,7 +291,8 @@ test("botcake: a search pick with a message id reacts (word card)", async () => 
   assert.ok(!calls.some((c) => c.url.includes("/reactions")), "the suggestion list does not react");
   calls.length = 0;
   const { envelope } = await postBotcake({ psid: SENDER_ID, text: "1", message_id: MID }, kv, calls);
-  assert.ok(envelope.text.includes("الكلمة:"), "the picked word card came back");
+  assert.equal(envelope.text, "", "envelope text cleared for a word card");
+  assert.ok(directText(calls).includes("الكلمة:"), "the picked word card came back via direct send");
   assert.ok(calls.some((c) => c.url === REACTIONS_URL), "a reactions call was made for the pick");
 });
 
