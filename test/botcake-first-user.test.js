@@ -88,15 +88,21 @@ test("first-ever user: the Worker sends the reply text directly", async () => {
   assert.equal(direct[0].body.message.text, envelope.text);
 });
 
-test("second message from the same user: no direct send (Botcake owns it)", async () => {
+test("second message from the same user: name completion goes direct", async () => {
   const kv = fakeKv();
   const calls = [];
   await postBotcake({ psid: NEW_PSID, text: "ϩⲉⲛⲥⲁⲃⲉⲉⲩ" }, kv, calls);
   // The first word wrote a search history, so the second turn is not first-ever.
+  // But the user is still awaitingName, and a letters-only message is the
+  // name attempt (isValidFullName) — so this turn completes the name, and
+  // the welcome goes out directly (live bug 23 Nov 2026: the flow dropped
+  // it and the user got silence). The envelope is cleared, no double.
   calls.length = 0;
   const { envelope } = await postBotcake({ psid: NEW_PSID, text: "ϩⲉⲛⲥⲁⲃⲉⲉⲩ" }, kv, calls);
-  assert.ok(envelope.text, "envelope still carries the text for the flow");
-  assert.equal(directTextSends(calls).length, 0, "no direct text send on the second message");
+  assert.equal(envelope.text, "", "envelope cleared after the direct welcome send");
+  const direct = directTextSends(calls);
+  assert.ok(direct.length >= 1, "welcome sent directly on name completion");
+  assert.match(direct[0].body.message.text, /مرحبًا بك/u, "first direct send is the welcome caption");
 });
 
 test("existing named user: no direct send", async () => {

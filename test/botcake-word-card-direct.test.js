@@ -98,6 +98,30 @@ test("existing user pick: card text sent directly, envelope text cleared", async
   assert.deepEqual(replies.map((q) => q.title), ["البداية", "تعلّم", "القائمة", "كلمة عشوائية", "تواصل معنا"]);
 });
 
+// Name completion (live bug 23 Nov 2026): a new user types their name
+// after the prompt — the name is saved and the envelope carries the
+// welcome + help, but the Worker sent nothing directly and the flow
+// dropped it, so the user got total silence and could leave the bot.
+// The welcome must now go out directly and the envelope must be cleared
+// (no double from the flow).
+test("new user name completion: welcome sent directly, envelope cleared", async () => {
+  const kv = fakeKv();
+  const calls = [];
+  await postBotcake({ psid: PSID, text: "مال" }, kv, calls);
+  calls.length = 0;
+  const { envelope } = await postBotcake({ psid: PSID, text: "أحمد محمد" }, kv, calls);
+  assert.equal(envelope.text, "", "envelope text cleared after direct send");
+  assert.equal(envelope.has_text, "no");
+  assert.equal(envelope.quick_replies, "", "envelope quick replies cleared");
+  const direct = directTextSends(calls);
+  assert.ok(direct.length >= 2, "welcome + help sent directly");
+  assert.match(direct[0].body.message.text, /مرحبًا بك أحمد محمد/u, "first direct send is the welcome caption");
+  const allDirect = direct.map((d) => d.body.message.text).join("\n");
+  assert.match(allDirect, /القاموس القبطي — المساعدة/u, "the help text goes out across the direct sends");
+  const last = direct[direct.length - 1];
+  assert.ok((last.body.message.quick_replies ?? []).length > 0, "quick replies ride on the last chunk");
+});
+
 // A brand-new user's first word still gets the name prompt, not a card —
 // the word-card block must not fire (and must not duplicate the
 // first-ever direct send).

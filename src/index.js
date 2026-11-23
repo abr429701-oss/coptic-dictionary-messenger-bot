@@ -588,6 +588,9 @@ export default {
       const caption = plainTextCard(await getWelcomeCaption(env, name));
       const replies = buildQuickReplies(MAIN_MENU_ITEMS.map((item) => ({ title: item.label, payload: item.payload })));
       const plan = {
+        // Name completed: the /botcake handler sends this directly (see
+        // the word-card block there) — the flow drops it otherwise.
+        nameCompleted: true,
         texts: [{ text: caption }, { text: parityHelpText(), quickReplies: replies }],
         voiceUrl: null,
       };
@@ -1519,22 +1522,27 @@ export default {
           console.error("Botcake first-user direct send failed", error instanceof Error ? error.message : "unknown");
         }
       }
-      // Word cards: send the card text directly (awaited), like the voice
-      // below. Live bug 23 Nov 2026: picking a suggestion returns only
-      // the voice — the flow drops the card text on pick turns (it reads
-      // its saved reply fields one run stale), while the voice, sent
-      // directly by the Worker, always arrives. Sending the text directly
-      // too makes the card complete (meaning, kind, origin). On success
-      // the envelope text is cleared so the flow sends nothing (no
-      // double); a chunk that fails to send stays in the envelope so the
-      // flow tries it as a fallback. Skipped for first-ever users (the
-      // direct send above already delivered their text), and the name
-      // gate prompt is not a word card (no wordCard flag), so a brand-new
-      // user still gets FIRST_TIME_TEXT first. The card carries no quick
-      // replies in the plan, so the five fixed navigation buttons from
-      // the flow's Content #7 are attached here (label as payload, so a
-      // tap arrives as the label and maps to its command).
-      if (plan?.wordCard && envelope.text && !isFirstEver) {
+      // Word cards and name completions: send the text directly
+      // (awaited), like the voice below. Live bug 23 Nov 2026: picking a
+      // suggestion returns only the voice — the flow drops the card text
+      // on pick turns (it reads its saved reply fields one run stale),
+      // while the voice, sent directly by the Worker, always arrives.
+      // Same bug, second face: after a new user types their name, the
+      // welcome + help text never arrives at all (the name IS saved, the
+      // envelope is correct, the Worker just never sends it directly and
+      // the flow drops it). Sending the text directly too makes both
+      // complete. On success the envelope text is cleared so the flow
+      // sends nothing (no double); a chunk that fails to send stays in
+      // the envelope so the flow tries it as a fallback. Skipped for
+      // first-ever users (the direct send above already delivered their
+      // text), and the name gate prompt is not a word card (no wordCard
+      // flag), so a brand-new user still gets FIRST_TIME_TEXT first.
+      // The card carries no quick replies in the plan, so the five fixed
+      // navigation buttons from the flow's Content #7 are attached here
+      // (label as payload, so a tap arrives as the label and maps to its
+      // command); a name completion carries its own replies (the main
+      // menu), which the envelope already holds, so they ride instead.
+      if ((plan?.wordCard || plan?.nameCompleted) && envelope.text && !isFirstEver) {
         try {
           let quickReplies = [];
           try {
@@ -1563,7 +1571,7 @@ export default {
             }
             const sent = await sendMessengerMessage(env, input.psid, msg, globalThis.fetch);
             if (!sent.ok) {
-              console.error("Botcake word-card direct send failed", sent.error ?? "unknown");
+              console.error("Botcake direct text send failed", sent.error ?? "unknown");
               break;
             }
             sentCount++;
@@ -1578,7 +1586,7 @@ export default {
           if (sentCount > 2) envelope.has_text3 = "no";
           if (sentCount === chunks.length) envelope.quick_replies = "";
         } catch (error) {
-          console.error("Botcake word-card direct send failed", error instanceof Error ? error.message : "unknown");
+          console.error("Botcake direct text send failed", error instanceof Error ? error.message : "unknown");
         }
       }
       // Voice cannot be sent from a Botcake flow: the Audio step is
