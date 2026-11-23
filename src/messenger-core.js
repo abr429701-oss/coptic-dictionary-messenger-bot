@@ -135,6 +135,27 @@ export function matchedPartIndex(record, normalizedQuery) {
   return parts.findIndex((part) => normalize(part).startsWith(normalizedQuery) || hasWholeWords(tokens(part), needle));
 }
 
+// Meaning options for one word card, Telegram/WhatsApp parity: one
+// meaning part per option, starting from the part the query matched
+// (or part 0). The card shows options[step] and steps through the
+// rest with "معنى آخر" — one meaning at a time, never all parts
+// joined on one card. Within one record only.
+export function meaningOptions(record, normalizedQuery = "", preferredPart = -1) {
+  if (!record) return [];
+  const options = [];
+  const add = (part) => {
+    const partText = splitMeaning(record.meaning)[part] ?? "";
+    const key = normalize(partText) || `0:${part}`;
+    if (!options.some((item) => item.key === key)) options.push({ key, part });
+  };
+  const firstPart = preferredPart >= 0 ? preferredPart : matchedPartIndex(record, normalizedQuery);
+  if (firstPart >= 0) add(firstPart);
+  else if (splitMeaning(record.meaning).length) add(0);
+  const parts = splitMeaning(record.meaning);
+  for (let part = 0; part < parts.length; part += 1) add(part);
+  return options;
+}
+
 export function suggestionLabel(record, normalizedQuery) {
   if (ARABIC_LETTER.test(normalizedQuery)) {
     const part = matchedPartIndex(record, normalizedQuery);

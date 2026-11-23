@@ -379,7 +379,7 @@ test("command displays: Arabic lines sit right (RLM), English/command lines sit 
   assert.equal(directLine(""), "");
   const help = parityHelpText();
   assert.doesNotMatch(help, /\*/u, "help carries no asterisks");
-  assert.ok(help.split("\n").some((l) => l === "\u200E/learn — الدروس والامتحانات والشهادات"), "one command per line, LTR");
+  assert.ok(help.split("\n").some((l) => l === "\u200E/learn — تعلم اللغة القبطية من بوت منفصل"), "one command per line, LTR");
   const admin = adminMenuText();
   assert.doesNotMatch(admin, /\*/u, "admin menu carries no asterisks");
   assert.ok(admin.split("\n").some((l) => l === "\u200E/stats — الإحصاءات"), "quick commands one per line, in order");

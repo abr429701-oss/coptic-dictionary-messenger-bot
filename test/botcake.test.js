@@ -2,7 +2,7 @@
 // names) and the flat JSON envelope the flow maps to variables.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { parseBotcakeInput, planToBotcakeEnvelope } from "../src/index.js";
+import { parseBotcakeInput, planToBotcakeEnvelope, normalizeBotcakeCommandText } from "../src/index.js";
 
 const url = (qs = "") => new URL(`https://example.workers.dev/botcake${qs}`);
 
@@ -187,4 +187,18 @@ test("planToBotcakeEnvelope flags are always real yes/no strings, never empty", 
       assert.ok(envelope[key] === "yes" || envelope[key] === "no", `${key} is ${envelope[key]}`);
     }
   }
+});
+
+test("normalizeBotcakeCommandText maps quick-reply button labels to commands", () => {
+  assert.equal(normalizeBotcakeCommandText("البداية"), "/start");
+  assert.equal(normalizeBotcakeCommandText("تعلّم"), "/learn");
+  assert.equal(normalizeBotcakeCommandText("تعلم"), "/learn");
+  assert.equal(normalizeBotcakeCommandText("القائمة"), "/menu");
+  assert.equal(normalizeBotcakeCommandText("كلمة عشوائية"), "/random");
+  assert.equal(normalizeBotcakeCommandText("تواصل معنا"), "/contact");
+  // Anything else passes through untouched (words, commands, numbers).
+  assert.equal(normalizeBotcakeCommandText("ⲁⲅⲁⲡⲏ"), "ⲁⲅⲁⲡⲏ");
+  assert.equal(normalizeBotcakeCommandText("/learn"), "/learn");
+  assert.equal(normalizeBotcakeCommandText("  تعلم  "), "/learn");
+  assert.equal(normalizeBotcakeCommandText(""), "");
 });

@@ -3,7 +3,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
-import worker, { localDictionaryCandidates, UserStore } from "../src/index.js";
+import worker, { localDictionaryCandidates, UserStore, planToBotcakeEnvelope } from "../src/index.js";
+import { buildGetCodeReply, buildGetCodeWhatsAppUrl } from "../src/getcode.js";
 import { suggestSimilar } from "../src/new-features.js";
 import {
   verifyMessengerSignature,
@@ -156,6 +157,20 @@ function fakeKv() {
     idFromName: (name) => name,
     get: () => ({ fetch: (url, options) => object.fetch(new Request(url, options)) }),
   };
+}
+
+// A KV pre-seeded with the default test user already registered, so
+// dictionary-search tests exercise search — not the new-user name gate
+// (a brand-new user's first word/like gets the name prompt instead).
+// Extra PSIDs are registered too, for tests that send from a second
+// sender and expect search routing (not the name gate) for them.
+function registeredKv(name = "اختبار المستخدم", extraPsids = []) {
+  const kv = fakeKv();
+  kv.store.set(`user:msgr:${SENDER_ID}`, { name, registeredAt: "2026-11-23T00:00:00.000Z" });
+  for (const psid of extraPsids) {
+    kv.store.set(`user:msgr:${psid}`, { name, registeredAt: "2026-11-23T00:00:00.000Z" });
+  }
+  return kv;
 }
 
 // Send one Messenger text and capture the outbound Send API calls.
@@ -492,7 +507,7 @@ test("messenger list order: labels starting with the query come first", async ()
   // by length difference). Lists are paginated (15 per page), so the
   // partition is checked across the first three pages (45 labels: 38
   // starters, then 7 contains).
-  const kvEnv = { ...env, USERS: fakeKv() };
+  const kvEnv = { ...env, USERS: registeredKv() };
   const page1 = await sendMessengerText("مال", { envOverride: kvEnv });
   const labels1 = numberedLines(page1).map((line) => line.replace(/^\d+\. /u, ""));
   assert.equal(labels1.length, 15, "page 1 shows 15");
@@ -515,30 +530,39 @@ test("messenger list order: labels starting with the query come first", async ()
 });
 
 test("messenger paginated list: Next/Prev quick replies turn pages, 15 per page", async () => {
-  const kvEnv = { ...env, USERS: fakeKv() };
-  // Page 1: one text message, 15 items, Next only.
+  const kv = registeredKv();
+  const kvEnv = { ...env, USERS: kv };
+  // Page 1: one text message, up to 15 items, Next only.
   const page1 = await sendMessengerText("نور", { envOverride: kvEnv });
+  // Derive the expected counts from the stored full list, not hardcoded
+  // numbers: the dictionary data changes, and a stale count fails the
+  // auto-sync (2026-11-22: 'نور' went 45 -> 44 results, page 1 15 -> 14).
+  const stored = kv.store.get(`messenger:lastlist:${SENDER_ID}`);
+  const total = stored && Array.isArray(stored.indices) ? stored.indices.length : 0;
+  const pageCount = Math.ceil(total / 15);
+  assert.ok(pageCount >= 3, "نور is a three-page query in the current data");
+  const pageItems = (page) => Math.min(15, Math.max(0, total - page * 15));
   assert.equal(page1.length, 2, "typing_on + one list text: 15 items fit one message");
   assert.equal(page1[0].payload.sender_action, "typing_on");
   assert.ok(page1[1].payload.message.text.length <= 2000, "page fits Meta's 2000-char text limit");
-  assert.equal(numberedLines(page1).length, 15);
-  assert.match(page1[1].payload.message.text, /صفحة 1 من 3/u);
+  assert.equal(numberedLines(page1).length, pageItems(0));
+  assert.match(page1[1].payload.message.text, new RegExp(`صفحة 1 من ${pageCount}`, "u"));
   const qr1 = page1[1].payload.message.quick_replies;
-  assert.equal(qr1.length, 13, "1 nav + 12 picks");
+  assert.equal(qr1.length, Math.min(13, 1 + pageItems(0)), "1 nav + up to 12 picks");
   assert.equal(qr1[0].payload, "list|next");
   assert.ok(!qr1.some((r) => r.payload === "list|prev"), "no Previous on page 1");
-  // Page 2: different 15 items, Prev + Next.
+  // Page 2: different items, Prev + Next.
   const page2 = await tapQuickReply("list|next", { envOverride: kvEnv });
-  assert.equal(numberedLines(page2).length, 15);
-  assert.match(page2[1].payload.message.text, /صفحة 2 من 3/u);
+  assert.equal(numberedLines(page2).length, pageItems(1));
+  assert.match(page2[1].payload.message.text, new RegExp(`صفحة 2 من ${pageCount}`, "u"));
   assert.notDeepEqual(numberedLines(page2), numberedLines(page1), "page 2 shows different items");
   const qr2 = page2[1].payload.message.quick_replies;
   assert.equal(qr2[0].payload, "list|prev");
   assert.equal(qr2[1].payload, "list|next");
   // Page 3: last page, Prev only.
   const page3 = await tapQuickReply("list|next", { envOverride: kvEnv });
-  assert.equal(numberedLines(page3).length, 15);
-  assert.match(page3[1].payload.message.text, /صفحة 3 من 3/u);
+  assert.equal(numberedLines(page3).length, pageItems(2));
+  assert.match(page3[1].payload.message.text, new RegExp(`صفحة 3 من ${pageCount}`, "u"));
   const qr3 = page3[1].payload.message.quick_replies;
   assert.equal(qr3[0].payload, "list|prev");
   assert.ok(!qr3.some((r) => r.payload === "list|next"), "no Next on the last page");
@@ -547,32 +571,45 @@ test("messenger paginated list: Next/Prev quick replies turn pages, 15 per page"
   assert.equal(end[1].payload.message.text, "لا توجد نتائج أخرى.");
   // Prev returns to page 2.
   const back = await tapQuickReply("list|prev", { envOverride: kvEnv });
-  assert.match(back[1].payload.message.text, /صفحة 2 من 3/u);
-  assert.equal(numberedLines(back).length, 15);
+  assert.match(back[1].payload.message.text, new RegExp(`صفحة 2 من ${pageCount}`, "u"));
+  assert.equal(numberedLines(back).length, pageItems(1));
 });
 
 test("messenger typed التالي/السابق pages the list", async () => {
-  const kvEnv = { ...env, USERS: fakeKv() };
+  const kv = registeredKv();
+  const kvEnv = { ...env, USERS: kv };
   await sendMessengerText("نور", { envOverride: kvEnv });
+  // Derive the page count and page-2 size from the stored full list, not
+  // hardcoded numbers (the dictionary data changes; see the paginated-list
+  // test above for the 2026-11-22 count drift).
+  const stored = kv.store.get(`messenger:lastlist:${SENDER_ID}`);
+  const total = stored && Array.isArray(stored.indices) ? stored.indices.length : 0;
+  const pageCount = Math.ceil(total / 15);
+  assert.ok(pageCount >= 2, "نور is a multi-page query in the current data");
+  const page2Items = Math.min(15, Math.max(0, total - 15));
   const page2 = await sendMessengerText("التالي", { envOverride: kvEnv });
-  assert.match(page2[1].payload.message.text, /صفحة 2 من 3/u);
-  assert.equal(numberedLines(page2).length, 15);
+  assert.match(page2[1].payload.message.text, new RegExp(`صفحة 2 من ${pageCount}`, "u"));
+  assert.equal(numberedLines(page2).length, page2Items);
   const page1 = await sendMessengerText("السابق", { envOverride: kvEnv });
-  assert.match(page1[1].payload.message.text, /صفحة 1 من 3/u);
+  assert.match(page1[1].payload.message.text, new RegExp(`صفحة 1 من ${pageCount}`, "u"));
   const end = await sendMessengerText("السابق", { envOverride: kvEnv });
   assert.equal(end[1].payload.message.text, "لا توجد نتائج أخرى.");
   // The emoji form of the button label navigates too.
   const page2b = await sendMessengerText("التالي ⏭", { envOverride: kvEnv });
-  assert.match(page2b[1].payload.message.text, /صفحة 2 من 3/u);
+  assert.match(page2b[1].payload.message.text, new RegExp(`صفحة 2 من ${pageCount}`, "u"));
 });
 
 test("messenger bare number on page 2 picks the correct global result", async () => {
-  const kv = fakeKv();
+  const kv = registeredKv();
   const kvEnv = { ...env, USERS: kv };
   await sendMessengerText("نور", { envOverride: kvEnv });
   await tapQuickReply("list|next", { envOverride: kvEnv });
   const stored = kv.store.get(`messenger:lastlist:${SENDER_ID}`);
-  assert.ok(stored && Array.isArray(stored.indices) && stored.indices.length === 45, "full list stored with page 2");
+  // The full result set is stored, not just the shown page: derive the
+  // expected total from the search itself, not a hardcoded count (the
+  // dictionary data changes; 2026-11-22: 'نور' went 45 -> 44 results).
+  const expectedTotal = localDictionaryCandidates("نور", 200).candidates.length;
+  assert.ok(stored && Array.isArray(stored.indices) && stored.indices.length === expectedTotal && expectedTotal > 15, "full list stored with page 2");
   assert.equal(stored.page, 1);
   const expected = records[stored.indices[15]];
   const pick1 = await sendMessengerText("1", { envOverride: kvEnv });
@@ -590,7 +627,7 @@ test("messenger bare number on page 2 picks the correct global result", async ()
 
 test("messenger Next on a single-page list does not appear", async () => {
   assert.ok(TYPO, "expected a typo query with suggestions but no local match");
-  const kvEnv = { ...env, USERS: fakeKv() };
+  const kvEnv = { ...env, USERS: registeredKv() };
   const calls = await sendMessengerText(TYPO.query, { envOverride: kvEnv });
   const message = calls[1].payload.message;
   assert.ok(Array.isArray(message.quick_replies));
@@ -600,7 +637,7 @@ test("messenger Next on a single-page list does not appear", async () => {
 });
 
 test("messenger stale list state: expired list falls back, pre-paging list asks for a fresh search", async () => {
-  const kv = fakeKv();
+  const kv = registeredKv();
   const kvEnv = { ...env, USERS: kv };
   const key = `messenger:lastlist:${SENDER_ID}`;
   // Expired (11 minutes old): "التالي" behaves as today — no live list,
@@ -797,7 +834,7 @@ test("messengerVoiceUrlWithOverlay: a /voice_delete tombstone falls back to the 
 });
 
 test("messenger bare number picks from the last list, same card as the quick reply", async () => {
-  const kvEnv = { ...env, USERS: fakeKv() };
+  const kvEnv = { ...env, USERS: registeredKv() };
   const listCalls = await sendMessengerText("نور", { envOverride: kvEnv });
   assert.equal(listCalls.length, 2, "typing_on + the list text");
   assert.equal(listCalls[0].payload.sender_action, "typing_on");
@@ -824,6 +861,71 @@ test("messenger bare number picks from the last list, same card as the quick rep
   assert.equal(tapCalls[1].payload.message.text, numCard);
 });
 
+test("messenger word card shows one meaning at a time, «معنى آخر» steps through them", async () => {
+  // ⲁⲅⲁⲡⲏⲧⲟⲥ has 4 meaning parts (حبيب، محبوب، مُحب، عزيز).
+  // Telegram/WhatsApp parity: the card shows ONE part, with a
+  // "معنى آخر" hint; typing it shows the next part, and past the
+  // last part it answers that the meanings are done.
+  const kvEnv = { ...env, USERS: registeredKv() };
+  const cardText = (calls) => {
+    const call = calls.find((c) => typeof c.payload?.message?.text === "string" && c.payload.message.text.includes("الكلمة:"));
+    return call?.payload?.message?.text ?? "";
+  };
+  await sendMessengerText("ⲁⲅⲁⲡⲏ", { envOverride: kvEnv });
+  const pick = await sendMessengerText("2", { envOverride: kvEnv });
+  const first = cardText(pick);
+  assert.ok(first.includes("حبيب"), "first card shows the first meaning");
+  assert.ok(!first.includes("محبوب"), "first card must not show the second meaning");
+  assert.ok(!first.includes("مُحب"), "first card must not show the third meaning");
+  assert.ok(!first.includes("عزيز"), "first card must not show the fourth meaning");
+  assert.ok(first.includes("معنى آخر"), "first card carries the more-meanings hint");
+  const second = cardText(await sendMessengerText("معنى آخر", { envOverride: kvEnv }));
+  assert.ok(second.includes("محبوب"), "second step shows the second meaning");
+  assert.ok(!second.includes("حبيب"), "second step must not repeat the first meaning");
+  assert.ok(second.includes("معنى آخر"), "second step still has more meanings");
+  const third = cardText(await sendMessengerText("معنى آخر", { envOverride: kvEnv }));
+  assert.ok(third.includes("مُحب"), "third step shows the third meaning");
+  const fourth = cardText(await sendMessengerText("معنى آخر", { envOverride: kvEnv }));
+  assert.ok(fourth.includes("عزيز"), "fourth step shows the last meaning");
+  assert.ok(!fourth.includes("معنى آخر"), "last meaning carries no more-meanings hint");
+  const doneCalls = await sendMessengerText("معنى آخر", { envOverride: kvEnv });
+  const doneText = doneCalls.map((c) => c.payload?.message?.text ?? "").join("\n");
+  assert.ok(doneText.includes("انتهت المعاني المتاحة لهذه الكلمة"), "past the last part the bot says the meanings are done");
+});
+
+test("get-code reply uses a short wa.me link that arrives whole", () => {
+  // Regression (verified live 22 Nov 2026): the wa.me link with a long
+  // percent-encoded Arabic message was ~370 chars, and the Botcake chunk
+  // splitter cut it mid-URL — the code arrived, but the link came out
+  // dead plus a raw "%D8%B9%D8%A7%D8%AF..." fragment. The pre-filled
+  // text is now short ("كودي: X، اسمي: Y") so the wa.me URL itself is
+  // ~190-210 chars for a normal triple name and rides whole inside one
+  // chunk — no link shortener (is.gd was tried first, rejected by the
+  // user, and made the get-code test flaky, so it was removed).
+  const reply = buildGetCodeReply("بيتر سعدالله فاروق", "90488651");
+  assert.ok(reply.includes("90488651"), "reply carries the code");
+  assert.ok(reply.includes("https://wa.me/201207829388?text="), "reply carries the WhatsApp link");
+  assert.ok(!reply.includes("is.gd"), "no shortener in the reply");
+  const url = buildGetCodeWhatsAppUrl("90488651", "بيتر سعدالله فاروق");
+  assert.ok(url.length < 300, "the wa.me link itself fits one chunk");
+  const envelope = planToBotcakeEnvelope({ texts: [{ text: reply }] });
+  const allText = [envelope.text, envelope.text2, envelope.text3].filter(Boolean).join("");
+  assert.ok(allText.includes(url), "the link arrives whole, never cut mid-URL");
+});
+
+test("botcake chunk split breaks long lines at word boundaries", () => {
+  // A long single line of words must split between words, never
+  // mid-word — the old hard slice cut words (and URLs) in half.
+  // Rejoining the chunks with single spaces must reproduce the
+  // original exactly, which fails if any word was cut.
+  const words = Array.from({ length: 60 }, (_, i) => `كلمة${i}`).join(" ");
+  const envelope = planToBotcakeEnvelope({ texts: [{ text: words }] });
+  const chunks = [envelope.text, envelope.text2, envelope.text3].filter(Boolean);
+  assert.ok(chunks.length > 1, "long text is split");
+  for (const chunk of chunks) assert.ok(chunk.length <= 300, "every chunk is within the limit");
+  assert.equal(chunks.join(" "), words);
+});
+
 test("messenger Arabic-Indic digits pick from the last list", async () => {
   const kvEnv = { ...env, USERS: fakeKv() };
   await sendMessengerText("نور", { envOverride: kvEnv });
@@ -834,9 +936,9 @@ test("messenger Arabic-Indic digits pick from the last list", async () => {
 });
 
 test("messenger out-of-range number falls back to search", async () => {
-  const kvEnv = { ...env, USERS: fakeKv() };
-  await sendMessengerText("نور", { envOverride: kvEnv });
   const otherSender = "111222333";
+  const kvEnv = { ...env, USERS: registeredKv("اختبار المستخدم", [otherSender]) };
+  await sendMessengerText("نور", { envOverride: kvEnv });
   const freshCalls = await sendMessengerText("46", { senderId: otherSender, envOverride: kvEnv });
   const rangedCalls = await sendMessengerText("46", { envOverride: kvEnv });
   assert.equal(rangedCalls.length, freshCalls.length, "out of range (نور has 45 items): same reply as a fresh search for 46");
@@ -844,7 +946,7 @@ test("messenger out-of-range number falls back to search", async () => {
 });
 
 test("messenger number with no stored list is a search, per sender", async () => {
-  const kvEnv = { ...env, USERS: fakeKv() };
+  const kvEnv = { ...env, USERS: registeredKv("اختبار المستخدم", ["999888777"]) };
   await sendMessengerText("نور", { envOverride: kvEnv });
   const calls = await sendMessengerText("2", { senderId: "999888777", envOverride: kvEnv });
   assert.match(calls[1].payload.message.text, /^اختر من الاقتراحات التالية:/u, "another sender has no list: 2 is searched, not picked");
@@ -1051,7 +1153,7 @@ test("wiring: bare number routes to the most recent list — dictionary list bea
 });
 
 test("wiring: bare number routes to the parity menu when the menu is newest", async () => {
-  const kv = fakeKv();
+  const kv = registeredKv();
   const kvEnv = { ...env, USERS: kv };
   await sendMessengerText("نور", { envOverride: kvEnv });
   await sendMessengerText("/learn", { envOverride: kvEnv });
@@ -1131,6 +1233,47 @@ test("wiring: first /start asks for the name; invalid names retry; a valid name 
   calls = await sendMessengerText("/start", { envOverride: kvEnv });
   assert.match(calls.at(-1).payload.message.text, /ابعت أي كلمة/u, "registered /start shows the parity welcome, not the name prompt");
   assert.doesNotMatch(calls.map((c) => c.payload.message?.text ?? "").join("\n"), /لأول مرة/u);
+});
+
+test("wiring: a brand-new user sending a word or a like gets the name prompt first, never a dictionary answer", async () => {
+  const kv = fakeKv();
+  const kvEnv = { ...env, USERS: kv };
+  // A first word from a brand-new user: the name prompt, no search
+  // results, no suggestions list.
+  let calls = await sendMessengerText("نور", { envOverride: kvEnv });
+  assert.equal(calls.length, 2, "typing_on + the first-time prompt");
+  assert.equal(calls[1].payload.message.text, FIRST_TIME_TEXT);
+  assert.doesNotMatch(calls.map((c) => c.payload.message?.text ?? "").join("\n"), /أرسل رقمًا للاختيار|المعنى/u);
+  // The gate is set: the word is now a name attempt, so an invalid
+  // name retries instead of searching.
+  calls = await sendMessengerText("123", { envOverride: kvEnv });
+  assert.equal(calls[1].payload.message.text, NAME_RETRY_TEXT);
+  // A valid name registers, and the search works afterwards.
+  calls = await sendMessengerText("سارة أحمد علي", { envOverride: kvEnv });
+  assert.match(calls[1].payload.message.text, /مرحبًا بك سارة أحمد علي/u);
+  calls = await sendMessengerText("نور", { envOverride: kvEnv });
+  assert.match(calls.map((c) => c.payload.message?.text ?? "").join("\n"), /أرسل رقمًا للاختيار/u);
+});
+
+test("wiring: a brand-new user sending a like gets the name prompt, not word suggestions", async () => {
+  const kv = fakeKv();
+  const kvEnv = { ...env, USERS: kv };
+  const calls = await sendMessengerText("👍", { envOverride: kvEnv });
+  assert.equal(calls.length, 2, "typing_on + the first-time prompt");
+  assert.equal(calls[1].payload.message.text, FIRST_TIME_TEXT);
+  assert.doesNotMatch(calls.map((c) => c.payload.message?.text ?? "").join("\n"), /أرسل رقمًا للاختيار|المعنى/u);
+});
+
+test("wiring: a brand-new user's command still works (not gated), but the next word is", async () => {
+  const kv = fakeKv();
+  const kvEnv = { ...env, USERS: kv };
+  // /help from a brand-new user answers (commands keep working).
+  let calls = await sendMessengerText("/help", { envOverride: kvEnv });
+  assert.match(calls.map((c) => c.payload.message?.text ?? "").join("\n"), /القاموس القبطي — المساعدة/u);
+  assert.doesNotMatch(calls.map((c) => c.payload.message?.text ?? "").join("\n"), /لأول مرة/u);
+  // The next plain word is gated: name prompt, not a search.
+  calls = await sendMessengerText("نور", { envOverride: kvEnv });
+  assert.equal(calls[1].payload.message.text, FIRST_TIME_TEXT);
 });
 
 test("wiring: registering notifies the admin by Messenger DM, but not when the sender is the admin", async () => {

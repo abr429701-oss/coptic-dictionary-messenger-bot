@@ -359,6 +359,7 @@ export function mainMenuText() {
     "3. 🎓 الشهادة — الحصول على شهادة مستوى",
     "4. 🔑 الرقم الكودي — الحصول على الرقم الكودي",
     "5. ❓ مساعدة — عرض الأوامر",
+    "6. 🔗 روابط المنصات — روابط التطبيق والموقع والبوتات",
   ].join("\n"));
 }
 
@@ -368,6 +369,7 @@ export const MAIN_MENU_ITEMS = [
   { type: "certmenu", label: "🎓 الشهادة", payload: "learn|certmenu" },
   { type: "getcode", label: "🔑 الرقم الكودي", payload: "learn|getcode" },
   { type: "help", label: "❓ مساعدة", payload: "learn|help" },
+  { type: "links", label: "🔗 روابط المنصات", payload: "learn|links" },
 ];
 
 export function parityWelcomeText() {
@@ -375,8 +377,9 @@ export function parityWelcomeText() {
     "📖 القاموس القبطي — ابعت أي كلمة بالقبطي أو العربي أو الإنجليزي أو الفرنسي أو الألماني، وأنا أجيب معناها ونطقها.",
     "",
     "الأوامر:",
-    "/learn — تعلم اللغة القبطية (الدروس والامتحانات والشهادات)",
-    "/menu — القائمة الرئيسية",
+    "/learn — تعلم اللغة القبطية من بوت منفصل",
+    "/learnhere — تعلم اللغة القبطية هنا",
+    "/links — روابط المنصات (التطبيق والموقع والبوتات)",
     "/cert — الحصول على الشهادة",
     "/getcode — الحصول على الرقم الكودي",
     "/help — المساعدة",
@@ -387,18 +390,34 @@ export function parityHelpText() {
   return directLines([
     "📖 القاموس القبطي — المساعدة",
     "",
-    "البحث: اكتب أي كلمة مباشرة: قبطي / عربي / إنجليزي / فرنسي / ألماني / يوناني.",
+    "البحث: اكتب أي كلمة مباشرة: قبطي / عربي / إنجليزي / فرنسي / ألماني.",
     "التعلم:",
-    "/learn — الدروس والامتحانات والشهادات",
+    "/learn — تعلم اللغة القبطية من بوت منفصل",
     "/getcode — الحصول على الرقم الكودي",
     "/cert — الشهادة",
     "القائمة:",
-    "/menu — القائمة الرئيسية",
+    "/learnhere — تعلم اللغة القبطية هنا",
+    "/links — روابط المنصات (التطبيق والموقع والبوتات)",
     "/start — بدء الاستخدام",
     "",
     "الدروس فيديو وصور من تطبيق التعلم، والامتحانات برابط تفتحه من المتصفح بعد إدخال رقمك الكودي.",
   ].join("\n"));
 }
+
+// Cross-platform links (same text in all three bots): the app, the
+// website, and the Telegram / Messenger / WhatsApp doors. Plain text,
+// verbatim — no bold markers, no HTML, no direction marks — so the
+// reply is byte-identical in every bot. Deliberately NOT passed
+// through directLines: the lines' first strong character is Arabic,
+// so they render on the correct side as-is.
+export const LINKS_TEXT = [
+  "🔗 روابط القاموس القبطي Ⲭⲏⲙⲓ",
+  "📲 التطبيق (أندرويد): https://is.gd/copticdictionary",
+  "🌐 الموقع الإلكتروني: https://copticdictionry.neocities.org/",
+  "📱 تيليجرام: https://t.me/Coptic_Dictionary_bot",
+  "💬 ماسنجر: https://m.me/Copticdictionary",
+  "🟢 واتساب: https://wa.me/message/WSYPILDL7WV7C1",
+].join("\n");
 
 // ---------------------------------------------------------------------------
 // Certificate result -> plan (mirrors Telegram's handleCertCode, with the
@@ -1530,6 +1549,7 @@ export function createMessengerParity(deps = {}) {
       if (item.type === "certmenu") return certLevelPickerPlan(senderId, state);
       if (item.type === "getcode") return beginGetCodeFlow(senderId, state);
       if (item.type === "help") return textPlan(parityHelpText());
+      if (item.type === "links") return textPlan(LINKS_TEXT);
       return textPlan("⚠️ اختيار غير معروف.");
     }
     if (list?.kind === "cert-level") return beginCertFlow(senderId, state, item.level);
@@ -2979,9 +2999,12 @@ export function createMessengerParity(deps = {}) {
         }
         case "help":
           return textPlan(parityHelpText());
+        case "learnhere":
         case "menu":
           await commit(senderId, state, { ...clearFlows });
           return mainMenuPlan(senderId, state);
+        case "links":
+          return textPlan(LINKS_TEXT);
         case "learn":
           await commit(senderId, state, { ...clearFlows });
           return levelsPlan(senderId, state);
@@ -3110,6 +3133,7 @@ export function createMessengerParity(deps = {}) {
       return textPlan("🔍 أرسل الكلمة التي تريد البحث عنها.");
     }
     if (raw === "learn|help") return textPlan(parityHelpText());
+    if (raw === "learn|links") return textPlan(LINKS_TEXT);
     return null;
   }
 

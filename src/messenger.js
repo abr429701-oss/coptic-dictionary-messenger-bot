@@ -25,6 +25,7 @@
 import { repeatSingleWordOgg } from "./ogg-repeat.js";
 
 export const MESSENGER_SEND_URL = "https://graph.facebook.com/v21.0/me/messages";
+export const MESSENGER_GRAPH_BASE_URL = "https://graph.facebook.com/v21.0";
 export const MESSENGER_PICK_PREFIX = "pick|";
 export const MESSENGER_QUICK_REPLY_MAX = 13; // Meta's limit per message
 export const MESSENGER_QUICK_REPLY_TITLE_MAX = 20; // Meta's limit, in characters
@@ -251,6 +252,51 @@ export async function sendMessengerSenderAction(env, recipientId, action, fetchI
   return { ok: true, recipientId: result.recipient_id };
 }
 
+// React to a user's message with a ❤️ (LOVE): POST the Messenger
+// "Message Reactions" edge, /{message-id}/reactions, with the Page token.
+// The Page reacts as itself on the user's message — no new message is
+// sent, so this costs 0 Botcake messages and 0 Worker requests beyond
+// this one direct Graph call. Best-effort only, like the typing
+// indicator: a missing token, a missing message id, or a failed call
+// never blocks or breaks the reply; failures log one line (status +
+// Meta's message) and return { ok: false }. The reaction value is the
+// Graph edge's uppercase enum (LOVE, LIKE, WOW, HAHA, SAD, ANGRY, ...).
+// Live verification of the exact edge shape is still pending (the
+// webhook path that carries a message id is unsubscribed, and the live
+// Botcake flow sends no message id — see parseBotcakeInput); a failed
+// shape fails safe here and shows up in the Worker logs.
+export async function sendMessengerReaction(env, messageId, reaction = "LOVE", fetchImpl = globalThis.fetch) {
+  const token = env?.MESSENGER_PAGE_TOKEN;
+  const mid = String(messageId ?? "").trim();
+  if (!token) return { ok: false, error: "missing-page-token" };
+  if (!mid) return { ok: false, error: "missing-message-id" };
+  let response;
+  try {
+    response = await fetchImpl(`${MESSENGER_GRAPH_BASE_URL}/${encodeURIComponent(mid)}/reactions`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ reaction: String(reaction || "LOVE").toUpperCase() }),
+    });
+  } catch (error) {
+    console.error("Messenger reaction failed (network)", error instanceof Error ? error.message : "unknown");
+    return { ok: false, error: "network" };
+  }
+  let result = null;
+  try {
+    result = await response.json();
+  } catch {
+    /* Meta answers JSON; a non-JSON body is a failure */
+  }
+  if (!response.ok || result?.success !== true) {
+    console.error("Messenger reaction failed", response.status, result?.error?.message ?? "unknown");
+    return { ok: false, error: result?.error?.message ?? `http-${response.status}` };
+  }
+  return { ok: true };
+}
+
 // Multipart photo upload (a ready certificate arrives as bytes, not a URL):
 // POST the same Send API endpoint with recipient + message as JSON fields
 // and the bytes as `filedata`. Meta answers the same { message_id } shape.
@@ -385,8 +431,12 @@ export async function sendWordVoice(env, senderId, voiceUrl, fetchImpl = globalT
 // One messaging event. planFor.text(query, senderId, attachments) /
 // planFor.pick(indexOrPayload, senderId) /
 // planFor.audio(attachment, senderId) return a plan
-// { texts: [{ text, quickReplies }], voiceUrl, voiceRepeats?, attachments?, photoBytes?, task? }
-// or null to stay silent. planFor.audio fires for an incoming audio
+// { texts: [{ text, quickReplies }], voiceUrl, voiceRepeats?, attachments?, photoBytes?, task?, wordCard? }
+// or null to stay silent. `wordCard` is set by the brain when the turn
+// shows a word card (search pick, deep link, /random, /wod, meaning
+// step) — the transport then love-reacts the user's message (a direct
+// Graph call, never a Botcake send); menus, lists, help, admin, learn,
+// errors and no-result turns never carry it, so they never react.
 // attachment (a Messenger voice message) when the message carries no
 // text or quick reply — the /record flow owns it. planFor.text also
 // receives the message's attachments (third arg): a captioned photo /
@@ -453,6 +503,18 @@ export async function handleMessengerMessaging(env, event, planFor, fetchImpl = 
   for (const item of plan.texts ?? []) {
     const result = await sendMessengerMessage(env, senderId, messengerTextMessage(item.text, item.quickReplies), fetchImpl);
     if (result.ok) sent = true;
+  }
+  // Word card shown: love-react the user's message (❤️). A direct Graph
+  // call on the incoming message's id — not a new message, so it costs
+  // nothing and cannot disturb the send order (word cards carry no quick
+  // replies). It runs after the card text is out, so it never delays the
+  // reply; a failure is swallowed (the card is the contract).
+  if (sent && plan.wordCard && message?.mid) {
+    try {
+      await sendMessengerReaction(env, message.mid, "LOVE", fetchImpl);
+    } catch (error) {
+      console.error("Messenger reaction failed", error instanceof Error ? error.message : "unknown");
+    }
   }
   if (plan.voiceUrl) {
     const result = await sendWordVoice(env, senderId, plan.voiceUrl, fetchImpl, plan.voiceRepeats ?? MESSENGER_VOICE_REPEATS);

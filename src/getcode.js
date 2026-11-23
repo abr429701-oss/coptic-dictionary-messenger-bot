@@ -38,8 +38,17 @@ export function getCodePhoneValid(phone) {
 // sheet). A contact list cannot be checked from Telegram or a web page,
 // so the arriving message — not the saved contact — is what gets
 // verified.
+//
+// The pre-filled text is deliberately SHORT ("كودي: X، اسمي: Y") so
+// the wa.me URL itself stays ~190-210 chars for a normal triple name
+// and rides whole inside one Botcake text chunk — no link shortener.
+// (A long Arabic message made the URL ~370 chars and the chunk
+// splitter cut it mid-URL, leaving a dead link plus a garbage
+// fragment — verified live 22 Nov 2026. A shortener (is.gd) fixed the
+// split but was rejected by the user and made the get-code test
+// flaky, so it was removed the same day.)
 export function buildGetCodeWhatsAppUrl(code, name) {
-  const text = `تم التسجيل، الرقم الكودي الخاص بي: ${code}، اسمي: ${name}`;
+  const text = `كودي: ${code}، اسمي: ${name}`;
   return `https://wa.me/${GET_CODE_WHATSAPP_NUMBER}?text=${encodeURIComponent(text)}`;
 }
 

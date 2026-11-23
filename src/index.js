@@ -29,6 +29,7 @@ import {
   buildQuickReplies,
   sendMessengerMessage,
   sendMessengerPhotoBytes,
+  sendMessengerReaction,
   sendWordVoice,
   messengerAttachmentMessage,
   messengerTextMessage,
@@ -41,7 +42,7 @@ import {
   MAIN_MENU_ITEMS,
 } from "./messenger-parity.js";
 import { createDispatchCommands } from "./dispatch-commands.js";
-import { suggestSimilar } from "./new-features.js";
+import { suggestSimilar, recordById, translationInLanguage } from "./new-features.js";
 import {
   storeCall,
   getUser,
@@ -59,7 +60,8 @@ import {
   lookupCodeName,
   fetchLiveExamPattern,
   localDictionaryCandidates,
-  matchedPartIndex,
+  meaningOptions,
+  UI_TEXT,
   formatRecord,
   uiTextFor,
   normalize,
@@ -214,13 +216,25 @@ function splitBotcakeText(value) {
   const text = typeof value === "string" ? value : "";
   if (text.length <= BOTCAKE_SPLIT_AT) return [text];
   // Break every line into <=CHUNK pieces first (a single very long line is
-  // hard-split), then greedily pack lines into chunks.
+  // hard-split), then greedily pack lines into chunks. Prefer a word
+  // boundary when hard-splitting: break at the last space within the
+  // limit so a long sentence splits between words, not mid-word. A line
+  // with no space at all (a URL) still hard-splits — a split URL is dead
+  // either way, so links that must arrive whole are kept short at the
+  // source (get-code's wa.me link uses a short pre-filled text).
   const pieces = [];
   for (const line of text.split("\n")) {
     let rest = line;
     while (rest.length > BOTCAKE_CHUNK_MAX) {
-      pieces.push(rest.slice(0, BOTCAKE_CHUNK_MAX));
-      rest = rest.slice(BOTCAKE_CHUNK_MAX);
+      const head = rest.slice(0, BOTCAKE_CHUNK_MAX + 1);
+      const cut = head.lastIndexOf(" ");
+      if (cut > 0) {
+        pieces.push(rest.slice(0, cut));
+        rest = rest.slice(cut + 1);
+      } else {
+        pieces.push(rest.slice(0, BOTCAKE_CHUNK_MAX));
+        rest = rest.slice(BOTCAKE_CHUNK_MAX);
+      }
     }
     pieces.push(rest);
   }
@@ -301,6 +315,34 @@ export function planToBotcakeEnvelope(plan) {
   };
 }
 
+// -- Botcake command buttons ------------------------------------------------
+// Botcake's Persistent Menu cannot send a command text to the brain (its
+// actions only send a canned message or start a flow), so the command
+// buttons live as FIXED quick replies on the bot's text messages instead.
+// Tapping one sends the button's Arabic label as the user's message, and the
+// brain only understands slash commands — so normalize the label to its
+// command here, before planFor runs. Diacritics are stripped so "تعلّم" and
+// "تعلم" both match.
+const BOTCAKE_BUTTON_ALIASES = {
+  "البداية": "/start",
+  "تعلم": "/learn",
+  "القائمة": "/menu",
+  "كلمة عشوائية": "/random",
+  "تواصل معنا": "/contact",
+};
+
+export function normalizeBotcakeCommandText(text) {
+  const raw = String(text ?? "").trim();
+  if (!raw) return raw;
+  // Strip Arabic diacritics (tashkeel U+064B–U+0652, superscript alef U+0670,
+  // tatweel U+0640) and collapse whitespace, then look up the button label.
+  const folded = raw
+    .replace(/[\u064B-\u0652\u0670\u0640]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return BOTCAKE_BUTTON_ALIASES[folded] ?? raw;
+}
+
 // -- Botcake input ----------------------------------------------------------
 // The flow's JSON API block sends the subscriber id + message text (and a
 // quick-reply payload when the user taps one). The exact variable names are
@@ -327,11 +369,22 @@ export function parseBotcakeInput(body, url) {
     pick("payload", "quick_reply_payload", "postback_payload") || (q?.get("payload") ?? "");
   const conversationId =
     pick("conversation_id", "conversationId") || (q?.get("conversation_id") ?? "");
+  // Incoming message id — the ❤️ reaction needs it. The live flow's JSON
+  // API body does NOT send one (it sends psid/text/first_name only), so
+  // this is null on the live path until the flow adds it; accept every
+  // plausible name so a one-line flow-body addition is all it takes.
+  // Candidates for the flow variable (UNVERIFIED — read the variable
+  // picker in the live flow builder; do NOT guess it into the flow):
+  // {{last_message_id}}, {{message_id}}, {{mid}}.
+  const messageId =
+    pick("message_id", "mid", "last_message_id", "messageId") ||
+    (q?.get("message_id") ?? q?.get("mid") ?? "");
   return {
     psid: psid || null,
     text,
     payload: payload || null,
     conversationId: conversationId || null,
+    messageId: messageId || null,
   };
 }
 
@@ -441,16 +494,20 @@ export default {
 
     // First-time name registration (Telegram parity: FIRST_TIME_TEXT,
     // /start gate at 8306, name capture at 8492-8504). Telegram asks for
-    // the name ONLY on /start, never on a first word: a new user who
-    // searches directly gets results, and is prompted the first time
-    // they send /start. While awaitingName, plain text is the name
-    // attempt (validated by isValidFullName, the same rule); commands
-    // keep working, /cancel never clears the gate (it clears an open
-    // cert/get-code flow, or falls back to Telegram's "write the word"
-    // text), and quick-reply picks are never gated — planFor.pick
-    // bypasses this entirely, like Telegram's menu handler running
-    // before its name check. A banned user stays silent: the ban check
-    // runs first and the gate returns null so parity silences them.
+    // the name ONLY on /start, never on a first word — but Messenger
+    // has no side menu forcing /start, so here a brand-new user (no
+    // record at all) is asked on ANY first non-command message: a word,
+    // a like/sticker, anything gets the name prompt before any
+    // dictionary answer (user's call, 2026-11-23: a new-device test
+    // sent a like and got word suggestions instead of the name prompt).
+    // While awaitingName, plain text is the name attempt (validated by
+    // isValidFullName, the same rule); commands keep working, /cancel
+    // never clears the gate (it clears an open cert/get-code flow, or
+    // falls back to Telegram's "write the word" text), and quick-reply
+    // picks are never gated — planFor.pick bypasses this entirely, like
+    // Telegram's menu handler running before its name check. A banned
+    // user stays silent: the ban check runs first and the gate returns
+    // null so parity silences them.
     // The name lives on the `user:msgr:<PSID>` record root (name /
     // awaitingName / registeredAt), exactly like Telegram's user
     // record, so /users shows it; the sheet push uses the
@@ -479,6 +536,25 @@ export default {
         }
         await saveUser(env, `msgr:${senderId}`, next);
         return { texts: [{ text: FIRST_TIME_TEXT }], voiceUrl: null };
+      }
+      // Brand-new user (no record at all) sending any non-command text
+      // — a word, a like/sticker, anything: ask for the name FIRST,
+      // before any dictionary answer. Messenger has no side menu that
+      // forces /start, so without this a new user who types a word or
+      // sends a like gets dictionary results (word suggestions) without
+      // ever being asked for their name — the flow the user flagged on
+      // 2026-11-23 (new-device test: a like returned word suggestions).
+      // Commands keep working (a /help from a new user still answers),
+      // and deep links still open the word first (wordLinkPlan runs
+      // before this gate in planFor.text). An existing user without a
+      // stored name is already awaitingName, so this branch only ever
+      // fires once, on the very first message.
+      if (!record) {
+        if (!text.startsWith("/")) {
+          await saveUser(env, `msgr:${senderId}`, { awaitingName: true });
+          return { texts: [{ text: FIRST_TIME_TEXT }], voiceUrl: null };
+        }
+        return null;
       }
       if (!record?.awaitingName) return null;
       // /cancel while waiting: Telegram clears an open cert/get-code
@@ -708,6 +784,16 @@ export default {
     // the user's voice prefs on `user:msgr:<PSID>` are honored here:
     // voiceOff suppresses the voice entirely, voiceRepeats 1 sends the
     // file once (/voiceonce) instead of the default 3× (/voicethree).
+    // Word share link (Telegram parity): every word card carries a
+    // one-tap link that opens this exact word for anyone who taps it
+    // (m.me ?ref=word_<id>). The Botcake flow delivers the ref as text
+    // or payload, and planFor opens the card (messengerWordLinkPlan
+    // below) — the same deep link Telegram's share button builds.
+    const MESSENGER_SHARE_BASE = "https://m.me/Copticdictionary?ref=word_";
+    function wordShareLine(record) {
+      if (record?.id == null) return "";
+      return `\n\n🔗 شارك الكلمة: ${MESSENGER_SHARE_BASE}${record.id}`;
+    }
     async function messengerCardPlan(env, record, searchedWord, partIndex = -1, senderId = null) {
       if (!record) return { texts: [], voiceUrl: null, voiceRepeats: 3 };
       let voiceOff = false;
@@ -718,10 +804,103 @@ export default {
         voiceRepeats = prefs?.voiceRepeats === 1 ? 1 : 3;
       }
       return {
-        texts: [{ text: plainTextCard(formatRecord(record, partIndex, searchedWord)) }],
+        texts: [{ text: plainTextCard(formatRecord(record, partIndex, searchedWord)) + wordShareLine(record) }],
         voiceUrl: !voiceOff && record.id != null ? await resolveMessengerVoice(env, record) : null,
         voiceRepeats,
+        // Word card: the transport love-reacts the user's message (❤️).
+        // messengerCardPlan is the single place all word cards are
+        // finalized (search pick, deep link, /random, /wod, meaning
+        // step), so the flag is exact — menus, lists, help, admin,
+        // learn, errors and no-result turns never pass through here.
+        wordCard: true,
       };
+    }
+
+    // Meaning pagination, Telegram/WhatsApp parity (21 Nov 2026): a word
+    // card shows ONE meaning part at a time, never all parts joined.
+    // When the word has more parts, the card carries a "معنى آخر" hint
+    // and the step state is stored per user (DO, 10-min TTL); typing
+    // "معنى آخر" advances to the next part. The state is keyed by the
+    // record's index in `records` plus the first part shown, so the
+    // options list recomputes identically on the next step.
+    const MESSENGER_LAST_MEANING_TTL_MS = 10 * 60 * 1000;
+    const MEANING_NEXT_NORMALIZED = "معني اخر";
+    function messengerLastMeaningKey(psid) {
+      return `messenger:lastmeaning:${String(psid)}`;
+    }
+    async function getMessengerLastMeaning(env, psid) {
+      if (!env?.USERS || psid == null) return null;
+      try {
+        const stored = (await storeCall(env, { op: "get", key: messengerLastMeaningKey(psid) })).value;
+        if (!stored || !Number.isInteger(stored.baseIndex) || !Number.isInteger(stored.step) || !Number.isInteger(stored.total)) return null;
+        if (Date.now() - Number(stored.at ?? 0) > MESSENGER_LAST_MEANING_TTL_MS) return null;
+        return stored;
+      } catch {
+        return null;
+      }
+    }
+    async function setMessengerLastMeaning(env, psid, value) {
+      if (!env?.USERS || psid == null) return;
+      try {
+        await storeCall(env, { op: "put", key: messengerLastMeaningKey(psid), value: { ...value, at: Date.now() } });
+      } catch (error) {
+        console.error("Messenger last-meaning save failed", error instanceof Error ? error.message : "unknown");
+      }
+    }
+    function meaningMoreHint() {
+      return `\n\n${UI_TEXT.ar.more} — أرسل «معنى آخر» لعرضه`;
+    }
+    async function messengerWordCardPlan(env, record, searchedWord, senderId) {
+      if (!record) return { texts: [], voiceUrl: null, voiceRepeats: 3 };
+      const options = meaningOptions(record, normalize(String(searchedWord ?? "")));
+      if (!options.length) return messengerCardPlan(env, record, searchedWord, -1, senderId);
+      const first = options[0];
+      const plan = await messengerCardPlan(env, record, searchedWord, first.part, senderId);
+      const baseIndex = records.indexOf(record);
+      if (options.length > 1 && senderId != null && baseIndex >= 0) {
+        await setMessengerLastMeaning(env, senderId, { baseIndex, firstPart: first.part, step: 0, total: options.length });
+        if (plan.texts?.length) plan.texts[0].text = `${plan.texts[0].text}${meaningMoreHint()}`;
+      }
+      return plan;
+    }
+    // Deep link (Telegram parity): "word_<id>" / "word_<id>_<en|fr|de>"
+    // opens that record's card directly — the same card (share line,
+    // voice, «معنى آخر» pagination) as a search + pick. The language
+    // suffix renders the card as if searched in that language
+    // (Telegram: the first translation in that language is the
+    // synthetic search key); no translation means the Arabic card. An
+    // unknown id answers with the brain's standard no-result text.
+    // Returns null when the text is not a word link.
+    const WORD_LINK_RE = /^word_(\d+)(?:_(en|fr|de))?$/u;
+    async function messengerWordLinkPlan(env, text, senderId) {
+      const m = WORD_LINK_RE.exec(String(text ?? "").trim());
+      if (!m) return null;
+      const record = recordById(Number(m[1]));
+      if (!record) return { texts: [{ text: uiTextFor("").noResult }], voiceUrl: null };
+      const key = m[2] ? translationInLanguage(record, m[2]) : "";
+      return messengerWordCardPlan(env, record, key, senderId);
+    }
+    async function messengerNextMeaningPlan(env, senderId) {
+      const stored = await getMessengerLastMeaning(env, senderId);
+      if (!stored) {
+        return { texts: [{ text: "ابحث عن كلمة أولاً، ثم أرسل «معنى آخر» لعرض معانيها الأخرى." }], voiceUrl: null };
+      }
+      const record = records[stored.baseIndex];
+      if (!record) {
+        return { texts: [{ text: "ابحث عن كلمة أولاً، ثم أرسل «معنى آخر» لعرض معانيها الأخرى." }], voiceUrl: null };
+      }
+      const options = meaningOptions(record, "", stored.firstPart);
+      const nextStep = stored.step + 1;
+      if (nextStep >= options.length || nextStep >= stored.total) {
+        return { texts: [{ text: UI_TEXT.ar.end }], voiceUrl: null };
+      }
+      const next = options[nextStep];
+      const plan = await messengerCardPlan(env, record, "", next.part, senderId);
+      await setMessengerLastMeaning(env, senderId, { ...stored, step: nextStep });
+      if (nextStep + 1 < options.length && plan.texts?.length) {
+        plan.texts[0].text = `${plan.texts[0].text}${meaningMoreHint()}`;
+      }
+      return plan;
     }
 
     // A numbered word-only list (labels only — meanings appear on the card
@@ -853,7 +1032,7 @@ export default {
         if (result.candidates.length === 1 || result.exactCount === 1 || sameWord) {
           const candidate = result.candidates[0];
           const record = records[candidate.row - 2];
-          return await messengerCardPlan(env, record, text, matchedPartIndex(record, normalized), senderId);
+          return await messengerWordCardPlan(env, record, text, senderId);
         }
         const items = messengerOrderItems(
           result.candidates
@@ -883,7 +1062,18 @@ export default {
     async function messengerPickPlan(env, index, senderId = null) {
       const record = records[index];
       if (!record) return { texts: [{ text: "لم أجد هذه الكلمة، ابحث عنها مرة أخرى." }], voiceUrl: null };
-      return await messengerCardPlan(env, record, "", -1, senderId);
+      // The card opens on the meaning the list showed for this item
+      // (an Arabic search's matched part, a Coptic search's part 0),
+      // so the pick's card contains the label the user tapped.
+      let searchedWord = "";
+      if (senderId != null) {
+        const stored = await getMessengerLastList(env, senderId);
+        if (stored) {
+          const pos = stored.indices.indexOf(index);
+          if (pos >= 0 && stored.labels?.[pos]) searchedWord = stored.labels[pos];
+        }
+      }
+      return await messengerWordCardPlan(env, record, searchedWord, senderId);
     }
 
     // Meta verification: GET /messenger-webhook?hub.mode=subscribe&
@@ -979,7 +1169,7 @@ export default {
           getUserRecord: messengerGetUserRecord,
           saveUserRecord: messengerSaveUserRecord,
           clearHistory: (psid) => clearMessengerHistory(env, psid),
-          wordCard: (record, senderId) => messengerCardPlan(env, record, "", -1, senderId ?? null),
+          wordCard: (record, senderId) => messengerWordCardPlan(env, record, "", senderId ?? null),
           hasRecordedVoice: async (id) => {
             try {
               const overlay = await getRecordedOverlay(env);
@@ -1094,6 +1284,12 @@ export default {
             const hasMedia = Array.isArray(attachments) && attachments.some((a) => a?.type && a.type !== "audio");
             await liveMonitorHook(senderId, hasMedia ? "media" : "text", query);
           }
+          // Deep link (Telegram parity): a tapped share link opens the
+          // word directly — before the name gate, so a first-time user
+          // who taps a shared link gets the word (Telegram's /start
+          // word_<id> likewise answers before the name prompt).
+          const wordLinkPlan = await messengerWordLinkPlan(env, query, senderId);
+          if (wordLinkPlan) return wordLinkPlan;
           // First-time name registration (Telegram parity): the gate
           // runs before flows and search; a plan means the turn is
           // answered here, null means normal routing (commands, flows,
@@ -1101,6 +1297,13 @@ export default {
           if (senderId != null) {
             const namePlan = await messengerNameGate(env, senderId, query, ctx);
             if (namePlan) return namePlan;
+          }
+          // Meaning pagination ("معنى آخر", typed): steps to the next
+          // meaning part of the last word card shown. Runs before list
+          // paging and number routing so the phrase is never searched
+          // as a dictionary word.
+          if (senderId != null && normalize(String(query ?? "").trim()) === MEANING_NEXT_NORMALIZED) {
+            return messengerNextMeaningPlan(env, senderId);
           }
           // Dictionary-list paging ("التالي ⏭" / "⏮ السابق", typed):
           // a live list turns one page — unless a parity flow is active
@@ -1143,6 +1346,13 @@ export default {
           return messengerSearchPlan(env, query, senderId);
         },
         pick: async (payload, senderId) => {
+          // Deep link via payload: an m.me ?ref=word_<id> tap arrives
+          // as a postback payload (Botcake or the webhook) — open the
+          // word card directly.
+          if (typeof payload === "string") {
+            const wordLinkPlan = await messengerWordLinkPlan(env, payload, senderId);
+            if (wordLinkPlan) return wordLinkPlan;
+          }
           if (typeof payload === "string" && MESSENGER_PARITY_PAYLOAD_PREFIXES.some((p) => payload.startsWith(p))) {
             return messengerParity.handlePick(senderId, payload);
           }
@@ -1196,6 +1406,27 @@ export default {
       }
       const started = Date.now();
       const planFor = await getPlanFor();
+      // First-ever message? A brand-new subscriber has no UserStore
+      // record AND no search history yet. Remember it BEFORE
+      // planFor.text runs (the search recording creates the history,
+      // /start creates the record), because a new user is exactly who
+      // the Botcake flow goes silent on (see the direct send below).
+      // Both signals are needed: a word search writes history but no
+      // user record, while /start writes a record but no history — so
+      // either one present means "has messaged before". getUser is
+      // memoized (5 s TTL) and saveUser refreshes the memo; the
+      // history read is always fresh, so this stays correct across
+      // rapid repeat messages.
+      let isFirstEver = false;
+      try {
+        const [existing, history] = await Promise.all([
+          getUser(env, `msgr:${input.psid}`).catch(() => null),
+          getUserHistory(env, `msgr:${input.psid}`).catch(() => []),
+        ]);
+        isFirstEver = !existing && (!history || history.length === 0);
+      } catch {
+        isFirstEver = false;
+      }
       // Typing indicator, best-effort: the user sees "يكتب..." while the
       // flow waits for this call. A failure never blocks the reply; the
       // flow's reply clears it, and a silent turn turns it off below.
@@ -1206,8 +1437,20 @@ export default {
       }
       let plan = null;
       try {
-        if (input.payload) plan = await planFor.pick(input.payload, input.psid);
-        else plan = await planFor.text(input.text, input.psid, null);
+        // Quick-reply button taps arrive as the button's Arabic label
+        // (as text, or as a payload). Map the label to its slash command
+        // so the brain answers it. A payload that is a command/label is
+        // text, not a list pick — route it through the text path.
+        const text = normalizeBotcakeCommandText(input.text);
+        const payloadAsText = input.payload
+          ? normalizeBotcakeCommandText(input.payload)
+          : "";
+        const payloadIsCommand =
+          Boolean(input.payload) &&
+          (payloadAsText.startsWith("/") || payloadAsText !== input.payload);
+        if (payloadIsCommand) plan = await planFor.text(payloadAsText, input.psid, null);
+        else if (input.payload) plan = await planFor.pick(input.payload, input.psid);
+        else plan = await planFor.text(text, input.psid, null);
       } catch (error) {
         console.error("Botcake plan failed", error instanceof Error ? error.message : "unknown");
         try {
@@ -1234,6 +1477,48 @@ export default {
         }
       }
       const envelope = planToBotcakeEnvelope(plan);
+      // First-ever message (new user): the Botcake flow reads the saved
+      // reply fields one run stale, and a brand-new subscriber has no
+      // previous fields at all — so its Conditions see empty and it
+      // sends NOTHING. Live case 23 Nov 2026: Asmaa Mohamed's first
+      // word got total silence (the Worker answered, the flow did not
+      // send). Send the reply text directly here so a new user always
+      // gets an answer on their first message. Botcake's flow also
+      // tries, but its fields are empty for a new user so it sends
+      // nothing — no double. From the second message on, the fields
+      // exist (saved by this run) and Botcake sends as normal, so this
+      // direct send only ever fires once per user. Awaited (like the
+      // video/cert sends) so it lands before the envelope returns.
+      if (isFirstEver && envelope.text) {
+        try {
+          let quickReplies = [];
+          try {
+            const parsed = envelope.quick_replies ? JSON.parse(envelope.quick_replies) : [];
+            if (Array.isArray(parsed)) quickReplies = parsed;
+          } catch {
+            /* no quick replies */
+          }
+          const chunks = [envelope.text, envelope.text2, envelope.text3].filter(Boolean);
+          for (let i = 0; i < chunks.length; i++) {
+            const isLast = i === chunks.length - 1;
+            const msg = { text: chunks[i] };
+            if (isLast && quickReplies.length) {
+              msg.quick_replies = quickReplies.map((q) => ({
+                content_type: "text",
+                title: String(q.title ?? "").slice(0, 20),
+                payload: String(q.payload ?? ""),
+              }));
+            }
+            const sent = await sendMessengerMessage(env, input.psid, msg, globalThis.fetch);
+            if (!sent.ok) {
+              console.error("Botcake first-user direct send failed", sent.error ?? "unknown");
+              break;
+            }
+          }
+        } catch (error) {
+          console.error("Botcake first-user direct send failed", error instanceof Error ? error.message : "unknown");
+        }
+      }
       // Voice cannot be sent from a Botcake flow: the Audio step is
       // upload-only (no URL, no variable — Phase 0, 21 Nov 2026), so the
       // Worker sends the voice itself, delayed ~3 s so the flow's text
@@ -1250,6 +1535,27 @@ export default {
             await sendWordVoice(env, input.psid, voiceUrl, globalThis.fetch, repeats);
           } catch (error) {
             console.error("Botcake voice send failed", error instanceof Error ? error.message : "unknown");
+          }
+        })());
+      }
+      // Word card shown: love-react the user's message (❤️) — a direct
+      // Graph call on the incoming message's id, in waitUntil like the
+      // voice, so it never delays the envelope or the flow's text. It
+      // only fires when the flow actually sent a message id (the live
+      // flow's JSON API body does NOT — it sends psid/text/first_name
+      // only — so this is a no-op live until the flow adds
+      // "message_id": "{{last_message_id}}" or the equivalent variable
+      // to its JSON API body; the variable name is UNVERIFIED, read it
+      // off the flow builder's variable picker, do not guess it).
+      // Without a message id there is nothing to react to, and the card
+      // still goes out exactly as before.
+      if (plan?.wordCard && input.messageId && ctx?.waitUntil) {
+        const messageId = input.messageId;
+        ctx.waitUntil((async () => {
+          try {
+            await sendMessengerReaction(env, messageId, "LOVE", globalThis.fetch);
+          } catch (error) {
+            console.error("Botcake reaction failed", error instanceof Error ? error.message : "unknown");
           }
         })());
       }
