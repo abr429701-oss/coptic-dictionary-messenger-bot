@@ -1332,11 +1332,18 @@ export function createMessengerParity(deps = {}) {
     } catch {
       result = { code: null, error: "macro-unreachable" };
     }
-    if (result?.code) return textPlan(buildGetCodeReply(name, String(result.code)));
+    if (result?.code) {
+      // Get-code reply: the /botcake handler sends this directly (see
+      // the word-card block there) — the flow drops it otherwise (live
+      // bug 24 Nov 2026: the code never arrived after name + phone).
+      return { ...textPlan(buildGetCodeReply(name, String(result.code))), getCodeReply: true };
+    }
     // The macro did not return a usable code (no URL linked, or the
     // deployment answers HTML): fall back to the registration
     // instructions — the web form link — so the student is never stuck.
-    return textPlan(`⚠️ تعذّر إحضار الرقم الكودي مباشرة من البوت حاليًا.\n\n${LEARN_GET_CODE_TEXT}`);
+    // The fallback is the same shape, so it rides the direct send too —
+    // otherwise the student gets silence instead of the instructions.
+    return { ...textPlan(`⚠️ تعذّر إحضار الرقم الكودي مباشرة من البوت حاليًا.\n\n${LEARN_GET_CODE_TEXT}`), getCodeReply: true };
   }
 
   // -- exams -----------------------------------------------------------------

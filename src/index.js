@@ -1522,27 +1522,33 @@ export default {
           console.error("Botcake first-user direct send failed", error instanceof Error ? error.message : "unknown");
         }
       }
-      // Word cards and name completions: send the text directly
-      // (awaited), like the voice below. Live bug 23 Nov 2026: picking a
-      // suggestion returns only the voice — the flow drops the card text
-      // on pick turns (it reads its saved reply fields one run stale),
-      // while the voice, sent directly by the Worker, always arrives.
-      // Same bug, second face: after a new user types their name, the
-      // welcome + help text never arrives at all (the name IS saved, the
-      // envelope is correct, the Worker just never sends it directly and
-      // the flow drops it). Sending the text directly too makes both
-      // complete. On success the envelope text is cleared so the flow
-      // sends nothing (no double); a chunk that fails to send stays in
-      // the envelope so the flow tries it as a fallback. Skipped for
-      // first-ever users (the direct send above already delivered their
-      // text), and the name gate prompt is not a word card (no wordCard
-      // flag), so a brand-new user still gets FIRST_TIME_TEXT first.
+      // Word cards, name completions and get-code replies: send the text
+      // directly (awaited), like the voice below. Live bug 23 Nov 2026:
+      // picking a suggestion returns only the voice — the flow drops the
+      // card text on pick turns (it reads its saved reply fields one run
+      // stale), while the voice, sent directly by the Worker, always
+      // arrives. Same bug, second face: after a new user types their
+      // name, the welcome + help text never arrives at all (the name IS
+      // saved, the envelope is correct, the Worker just never sends it
+      // directly and the flow drops it). Same bug, third face (24 Nov
+      // 2026): after a user types their name + phone for get-code, the
+      // code reply never arrives — the envelope is correct, the Worker
+      // sent nothing directly, the flow drops it. Sending the text
+      // directly too makes all three complete. On success the envelope
+      // text is cleared so the flow sends nothing (no double); a chunk
+      // that fails to send stays in the envelope so the flow tries it as
+      // a fallback. Skipped for first-ever users (the direct send above
+      // already delivered their text), and the name gate prompt is not a
+      // word card (no wordCard flag), so a brand-new user still gets
+      // FIRST_TIME_TEXT first.
       // The card carries no quick replies in the plan, so the five fixed
       // navigation buttons from the flow's Content #7 are attached here
       // (label as payload, so a tap arrives as the label and maps to its
       // command); a name completion carries its own replies (the main
       // menu), which the envelope already holds, so they ride instead.
-      if ((plan?.wordCard || plan?.nameCompleted) && envelope.text && !isFirstEver) {
+      // A get-code reply likewise carries no replies, so it gets the
+      // five fixed buttons too.
+      if ((plan?.wordCard || plan?.nameCompleted || plan?.getCodeReply) && envelope.text && !isFirstEver) {
         try {
           let quickReplies = [];
           try {
