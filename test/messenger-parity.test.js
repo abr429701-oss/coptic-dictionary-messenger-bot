@@ -116,9 +116,9 @@ function makeParity(deps = {}) {
 test("admin audit covers all 332 Telegram commands exactly once, plus 2 Messenger extras", () => {
   const counts = adminAuditCounts();
   assert.equal(counts.total, 334);
-  assert.equal(counts.impl, 245);
+  assert.equal(counts.impl, 248);
   assert.equal(counts.dispatch, 12);
-  assert.equal(counts.na, 77);
+  assert.equal(counts.na, 74);
   const seen = new Set();
   for (const row of ADMIN_AUDIT) {
     assert.ok(!seen.has(row.command), `duplicate audit row: ${row.command}`);
@@ -144,7 +144,7 @@ test("admin audit statuses: Telegram-only, dispatch, and implemented samples", (
   assert.equal(adminCommandStatus("record_choose").status, "impl");
   assert.equal(adminCommandStatus("record_stop").status, "impl");
   assert.equal(adminCommandStatus("exportcsv").status, "na");
-  assert.equal(adminCommandStatus("schedule").status, "na");
+  assert.equal(adminCommandStatus("schedule").status, "impl", "scheduled broadcasts are implemented (parity flow + cron tick)");
   assert.equal(adminCommandStatus("2fa").status, "na");
   assert.equal(adminCommandStatus("quiz").status, "dispatch", "parked quiz stays dispatch with its parked reason");
   assert.equal(adminCommandStatus("quiz").reason, "الاختبارات داخل المحادثة غير مبنية في ماسنجر — الامتحانات برابط من /learn");

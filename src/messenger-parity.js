@@ -75,6 +75,7 @@ import {
   getCodePhoneValid,
 } from "./getcode.js";
 import { buildQuickReplies, plainTextCard } from "./messenger.js";
+import { parseScheduleTime, formatCairoDateTime } from "./schedule-time.js";
 import { PARKED_DISPATCH_MESSAGES } from "./dispatch-commands.js";
 import { listRecordedVoiceIds, recordedManifestFilename } from "./neural-voice.js";
 import {
@@ -719,11 +720,9 @@ export const ADMIN_NOT_APPLICABLE = {
   export: "تنزيل ملف — ماسنجر لا يستقبل ملفات مولّدة من البوت",
   backup: "تنزيل نسخة احتياطية كملف — ماسنجر لا يستقبل ملفات مولّدة من البوت",
   backupauto: "نسخة احتياطية تلقائية كملف إلى تيليجرام — لا يوجد مقابل في ماسنجر",
-  // Broadcast: scheduling and segments live in the Telegram admin flow.
+  // Broadcast: scheduling lives in the scheduled-broadcast flow below
+  // (broadcastCommand cases + the scheduleFlow state in handleText).
   segment: "الشرائح تُعرَّف في سير عمل أدمن تيليجرام — لا يوجد مقابل في ماسنجر",
-  schedule: "جدولة البث تحتاج مجدولًا — لا يوجد مجدول على مسار ماسنجر بعد",
-  schedules: "جدولة البث تحتاج مجدولًا — لا يوجد مجدول على مسار ماسنجر بعد",
-  unschedule: "جدولة البث تحتاج مجدولًا — لا يوجد مجدول على مسار ماسنجر بعد",
   autoreply: "محرك الرد التلقائي في تيليجرام — لا يوجد مقابل موصول في ماسنجر",
   // System: Telegram sessions and Bot API settings.
   sessionlist: "جلسات تيليجرام (polling/webhook) — لا يوجد مقابل في ماسنجر",
@@ -1109,6 +1108,7 @@ export function createMessengerParity(deps = {}) {
   //   { certAwaiting: "0"|"1", getcodeStep: "name"|"phone",
   //     getcodeName, examAwaiting: { formId, examUrl, lessonId },
   //     lastLessonId, lastLevelId, pendingBroadcast,
+  //     scheduleFlow: { stage: "await-message"|"await-time", draft },
   //     recordState: { mode: "sequential"|"chosen", id, coptic },
   //     recordPick: true (choosing a word for /record_choose),
   //     menuList: { kind, items: [...] } }
@@ -1161,7 +1161,7 @@ export function createMessengerParity(deps = {}) {
   const clearFlows = {
     certAwaiting: undefined, getcodeStep: undefined, getcodeName: undefined,
     examAwaiting: undefined, pendingBroadcast: undefined, pendingConfirm: undefined, menuList: undefined,
-    recordState: undefined, recordPick: undefined,
+    recordState: undefined, recordPick: undefined, scheduleFlow: undefined,
   };
 
   // -- voice recording (/record) -------------------------------------------
@@ -1594,6 +1594,101 @@ export function createMessengerParity(deps = {}) {
       had = await unbanUser(psid);
     } catch { had = false; }
     return textPlan(had ? `✅ تم إلغاء حظر ${psid}.` : "هذا الرقم ليس محظورًا.");
+  }
+
+  // -- scheduled broadcasts (/schedule, /schedules, /unschedule) -----------
+  // Same compose flow as Telegram/WhatsApp: /schedule (or /schedule <text>)
+  // captures the message, then a time («بعد ساعتين», «26/11 08:00» Cairo),
+  // and the 5-minute cron tick sends it. Jobs live in the admin store
+  // under SCHEDULED_BROADCAST_KEY; the tick reads the same key.
+  //
+  // Media limit (Messenger-only, 2026-11-25): the live receive path is
+  // Botcake, which forwards TEXT only — the Worker never sees an admin's
+  // photo/video (the Meta webhook path is unsubscribed). So media is
+  // scheduled by pasting its PUBLIC URL (e.g. an R2 link, like the /share
+  // poster) with an optional caption; the tick sends it as an attachment.
+  // Facebook CDN URLs expire — use a stable public link (R2).
+  const SCHEDULED_BROADCAST_KEY = "broadcast:scheduled";
+  const SCHEDULE_TIME_PROMPT = [
+    "⏰ اكتب ميعاد الإرسال:",
+    "• «بعد ساعتين» أو «بعد 30 دقيقة»",
+    "• «بكرة 08:00» أو «النهاردة 21:00»",
+    "• «26/11 08:00»",
+    "أو أرسل «إلغاء» للتراجع.",
+  ].join("\n");
+  const SCHEDULE_MEDIA_EXTS = {
+    image: ["jpg", "jpeg", "png", "gif", "webp"],
+    video: ["mp4", "mov", "webm"],
+  };
+  function extractScheduleMedia(text) {
+    const match = String(text ?? "").match(/https?:\/\/\S+/u);
+    if (!match) return null;
+    const url = match[0].replace(/[.,;!?)\]]+$/u, "");
+    const ext = (url.split("?")[0].split(".").pop() ?? "").toLowerCase();
+    const kind = SCHEDULE_MEDIA_EXTS.video.includes(ext) ? "video"
+      : SCHEDULE_MEDIA_EXTS.image.includes(ext) ? "image" : null;
+    if (!kind) return null;
+    const caption = String(text ?? "").replace(match[0], "").replace(/\s+/gu, " ").trim();
+    return { kind, mediaUrl: url, caption };
+  }
+  function scheduleDraftFromText(text) {
+    const media = extractScheduleMedia(text);
+    if (media) return { kind: media.kind, mediaUrl: media.mediaUrl, caption: media.caption || "" };
+    return { kind: "text", text: String(text ?? "") };
+  }
+  function scheduleJobLabel(job) {
+    if (!job) return "";
+    if (job.kind === "text") return String(job.text ?? "").slice(0, 60);
+    if (job.kind === "video") return `🎬 فيديو${job.caption ? ` — ${String(job.caption).slice(0, 40)}` : ""}`;
+    if (job.kind === "image") return `📷 صورة${job.caption ? ` — ${String(job.caption).slice(0, 40)}` : ""}`;
+    return String(job.text ?? "").slice(0, 60);
+  }
+  async function loadScheduledJobs() {
+    let jobs = [];
+    try { jobs = (await safeCall(store.get, SCHEDULED_BROADCAST_KEY)) ?? []; } catch { jobs = []; }
+    return Array.isArray(jobs) ? jobs.filter((j) => j && typeof j.id === "string" && Number.isFinite(j.sendAt)) : [];
+  }
+  async function saveScheduledJobs(jobs) {
+    await safeCall(store.put, SCHEDULED_BROADCAST_KEY, jobs);
+  }
+  function scheduleJobId() {
+    return Math.random().toString(36).slice(2, 8);
+  }
+  async function scheduleBroadcastPlan(senderId, state, arg) {
+    const text = String(arg ?? "").trim();
+    if (text) {
+      if (text.length > BROADCAST_MAX_CHARS) return textPlan(`⚠️ الرسالة طويلة جدًا (الحد ${BROADCAST_MAX_CHARS} حرف).`);
+      const draft = scheduleDraftFromText(text);
+      await commit(senderId, state, { scheduleFlow: { stage: "await-time", draft } });
+      return textPlan(`📅 الرسالة جاهزة:\n${scheduleJobLabel(draft)}\n\n${SCHEDULE_TIME_PROMPT}`);
+    }
+    await commit(senderId, state, { scheduleFlow: { stage: "await-message", draft: null } });
+    return textPlan([
+      "📅 أرسل رسالة البث — نص، أو رابط صورة/فيديو عام مع نص اختياري.",
+      "مثال: رابط صورة من R2 ثم سطر نصي كتعليق.",
+      "⚠️ البوت يستقبل النصوص فقط في ماسنجر، فالصور والفيديوهات تُجدول برابطها العام (روابط فيسبوك المؤقتة قد تنتهي قبل الميعاد — استخدم رابطًا ثابتًا مثل R2).",
+      "أو أرسل «إلغاء» للتراجع.",
+    ].join("\n"));
+  }
+  async function sendScheduledList(senderId) {
+    const jobs = (await loadScheduledJobs()).sort((a, b) => a.sendAt - b.sendAt);
+    if (!jobs.length) return textPlan("📅 لا توجد رسائل مجدولة.");
+    const lines = ["📅 الرسائل المجدولة:"];
+    for (const job of jobs) {
+      const sending = job.status === "sending" ? " ⏳ جارٍ الإرسال" : "";
+      lines.push(`• ${formatCairoDateTime(job.sendAt)} — ${scheduleJobLabel(job)} (🆔 ${job.id})${sending}`);
+    }
+    lines.push("", "للإلغاء: /unschedule <المعرف>");
+    return textPlan(lines.join("\n"));
+  }
+  async function cancelScheduled(senderId, id) {
+    const jobId = String(id ?? "").trim();
+    if (!jobId) return textPlan("✏️ الاستخدام: /unschedule <المعرف> — اعرض المعرفات بـ /schedules");
+    const jobs = await loadScheduledJobs();
+    const job = jobs.find((j) => j.id === jobId);
+    if (!job) return textPlan(`⚠️ لا توجد رسالة مجدولة بالمعرف «${jobId}».`);
+    await saveScheduledJobs(jobs.filter((j) => j.id !== jobId));
+    return textPlan(`✅ تم إلغاء الرسالة المجدولة «${scheduleJobLabel(job)}» (${formatCairoDateTime(job.sendAt)}).`);
   }
 
   async function adminBroadcastPlan(senderId, state, arg) {
@@ -2230,6 +2325,12 @@ export function createMessengerParity(deps = {}) {
         if (!stats) return textPlan("📢 إحصاءات البث\nلا توجد بيانات بعد.");
         return textPlan(["📢 إحصاءات البث", `أُرسلت: ${stats.sent ?? 0}`, `الإجمالي: ${stats.total ?? 0}`, stats.running ? "الحالة: جارٍ الآن" : "الحالة: متوقف"].join("\n"));
       }
+      case "schedule":
+        return scheduleBroadcastPlan(senderId, state, arg);
+      case "schedules":
+        return sendScheduledList(senderId);
+      case "unschedule":
+        return cancelScheduled(senderId, arg);
       case "targeted": {
         const [target, ...textParts] = String(arg ?? "").trim().split(/\s+/u);
         const psid = normalizeTargetPsid(target);
@@ -3029,6 +3130,62 @@ export function createMessengerParity(deps = {}) {
       if (isBroadcastCancel(text)) {
         await commit(senderId, state, { pendingBroadcast: undefined });
         return textPlan("تم إلغاء البث ✅");
+      }
+    }
+
+    // Pending scheduled broadcast (admin only): the compose flow.
+    // Checked with the broadcast confirm, before the learn flows, so a
+    // message or a time is never swallowed as a cert / exam code. A
+    // command (e.g. /schedules, /cancel) is never captured: it falls
+    // through to the command switch below, and the flow stays open
+    // until the admin types the message / time or cancels it.
+    if (isAdmin(senderId) && state.scheduleFlow && !isCommand) {
+      const flow = state.scheduleFlow;
+      if (isBroadcastCancel(text)) {
+        await commit(senderId, state, { scheduleFlow: undefined });
+        return textPlan("تم إلغاء الجدولة ✅");
+      }
+      if (flow.stage === "await-message") {
+        if (text.length > BROADCAST_MAX_CHARS) return textPlan(`⚠️ الرسالة طويلة جدًا (الحد ${BROADCAST_MAX_CHARS} حرف). أرسل رسالة أقصر، أو «إلغاء» للتراجع.`);
+        const draft = scheduleDraftFromText(text);
+        await commit(senderId, state, { scheduleFlow: { stage: "await-time", draft } });
+        return textPlan(`📅 الرسالة جاهزة:\n${scheduleJobLabel(draft)}\n\n${SCHEDULE_TIME_PROMPT}`);
+      }
+      if (flow.stage === "await-time") {
+        if (!flow.draft) {
+          await commit(senderId, state, { scheduleFlow: undefined });
+          return textPlan("⚠️ انتهت جلسة الجدولة — أرسل /schedule من جديد.");
+        }
+        const parsed = parseScheduleTime(text);
+        if (!parsed.ok) return textPlan(`${parsed.error}\n\n${SCHEDULE_TIME_PROMPT}`);
+        const jobs = await loadScheduledJobs();
+        const job = {
+          id: scheduleJobId(),
+          sendAt: parsed.ms,
+          status: "queued",
+          sent: 0,
+          createdBy: String(senderId),
+          createdAt: Date.now(),
+          ...(flow.draft.kind === "text"
+            ? { kind: "text", text: flow.draft.text }
+            : { kind: flow.draft.kind, mediaUrl: flow.draft.mediaUrl, caption: flow.draft.caption || "" }),
+        };
+        jobs.push(job);
+        await saveScheduledJobs(jobs);
+        await commit(senderId, state, { scheduleFlow: undefined });
+        let recipientCount = "?";
+        try {
+          const recipients = listRecipients ? await listRecipients() : [];
+          recipientCount = String(recipients?.length ?? 0);
+        } catch { /* the count is best-effort; the job is saved either way */ }
+        return textPlan([
+          "✅ تمت جدولة الرسالة:",
+          scheduleJobLabel(job),
+          `⏰ الميعاد: ${formatCairoDateTime(job.sendAt)} (بتوقيت القاهرة)`,
+          `👥 المستلمون: ${recipientCount} مستخدم`,
+          `🆔 المعرف: ${job.id} — للإلغاء: /unschedule ${job.id}`,
+          "📋 اعرض المجدول بـ /schedules",
+        ].join("\n"));
       }
     }
 

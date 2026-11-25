@@ -18,7 +18,7 @@ import { parseCertCsv } from "./certificates.js";
 import { extractCodePattern } from "./exam-pattern.js";
 import { translateFieldValue } from "./field-translations.js";
 import { GET_CODE_SHEET_ID } from "./getcode.js";
-import { messengerTextMessage, sendMessengerMessage } from "./messenger.js";
+import { messengerTextMessage, messengerAttachmentMessage, sendMessengerMessage } from "./messenger.js";
 import { levenshtein } from "./new-features.js";
 
 // Usage-alert DMs go to the Telegram admin in the original bot;
@@ -30,6 +30,16 @@ export const DEFAULT_ADMIN_IDS = "813894692";
 export const ADMIN_AUDIT_KEY = "admin:audit:actions";
 
 export const BROADCAST_CTRL_KEY = "broadcast:control";
+
+// A broadcast is "running" from the moment its loop starts until it ends
+// (set by executeMessengerTask, cleared in its finally). The scheduled
+// tick reads this key so a due job waits behind a running broadcast
+// instead of sending on top of it (queue-after-current).
+export const BROADCAST_RUNNING_KEY = "broadcast:running";
+
+// Scheduled broadcasts (see /schedule in messenger-parity.js): jobs live
+// under this DO key; the 5-minute cron tick runs the due ones.
+export const SCHEDULED_BROADCAST_KEY = "broadcast:scheduled";
 
 export async function readAdminAudit(env) { if (!env.USERS) return []; const v = ((await storeCall(env, { op: "get", key: ADMIN_AUDIT_KEY })).value ?? []); return Array.isArray(v) ? v : []; }
 
@@ -732,23 +742,139 @@ export async function executeMessengerTask(env, task, from, fetchImpl = globalTh
       await sendText(from, "⏸️ البث متوقف مؤقتًا (استخدم /bcresume لاستئنافه).");
       return false;
     }
+    // Mark the broadcast running so a scheduled job queued behind it
+    // waits (the tick checks BROADCAST_RUNNING_KEY first). Cleared in
+    // the finally below, even when the loop breaks early.
+    if (env.USERS) {
+      await storeCall(env, { op: "put", key: BROADCAST_RUNNING_KEY, value: { startedAt: Date.now(), scheduledId: task.scheduledId ?? null, from: String(from ?? "") } }).catch(() => null);
+    }
+    const isScheduled = Boolean(task.scheduledId);
+    const mediaUrl = typeof task.mediaUrl === "string" && task.mediaUrl ? task.mediaUrl : "";
+    const mediaKind = task.mediaKind === "video" ? "video" : "image";
+    const bodyText = typeof task.caption === "string" && task.caption
+      ? task.caption
+      : (typeof task.text === "string" ? task.text : "");
+    const resumeFrom = Number.isFinite(task.resumeFrom) && task.resumeFrom > 0 ? Math.floor(task.resumeFrom) : 0;
+    const resilient = task.resilient === true;
+    const onProgress = typeof task.onProgress === "function" ? task.onProgress : null;
     const recipients = await messengerBroadcastRecipients(env);
-    let sent = 0;
+    let sent = resumeFrom;
     let consecutiveFailures = 0;
-    for (const psid of recipients) {
-      if (consecutiveFailures >= MESSENGER_BROADCAST_MAX_FAILURES) break;
-      if (sent > 0 && gapMs > 0) await new Promise((resolve) => setTimeout(resolve, gapMs));
-      const result = await sendText(psid, task.text);
-      if (result.ok) {
-        sent += 1;
-        consecutiveFailures = 0;
-      } else {
-        consecutiveFailures += 1;
+    let loopIndex = 0;
+    let completed = true;
+    try {
+      for (let i = resumeFrom; i < recipients.length; i++) {
+        const psid = recipients[i];
+        if (!resilient && consecutiveFailures >= MESSENGER_BROADCAST_MAX_FAILURES) { completed = false; break; }
+        if (loopIndex > 0 && gapMs > 0) await new Promise((resolve) => setTimeout(resolve, gapMs));
+        loopIndex += 1;
+        let ok = true;
+        if (mediaUrl) {
+          const media = await sendMessengerMessage(env, psid, messengerAttachmentMessage(mediaKind, mediaUrl), fetchImpl);
+          ok = media.ok;
+        }
+        if (ok && bodyText) {
+          const result = await sendText(psid, bodyText);
+          ok = result.ok;
+        }
+        if (ok) {
+          sent += 1;
+          consecutiveFailures = 0;
+          if (onProgress && sent % 10 === 0) {
+            try { await onProgress(sent); } catch { /* progress is best-effort */ }
+          }
+        } else {
+          consecutiveFailures += 1;
+        }
+      }
+    } finally {
+      if (env.USERS) {
+        await storeCall(env, { op: "put", key: BROADCAST_RUNNING_KEY, value: null }).catch(() => null);
       }
     }
-    await sendText(from, `📢 تم إرسال البث إلى ${sent} من ${recipients.length}.`);
+    if (onProgress && sent % 10 !== 0) {
+      try { await onProgress(sent); } catch { /* progress is best-effort */ }
+    }
+    if (!completed) {
+      await sendText(from, `⏸ توقف البث بعد ${sent} من ${recipients.length} (أخطاء متتالية) — سيُستأنف تلقائيًا.`);
+      return false;
+    }
+    await sendText(from, isScheduled
+      ? `📢 اكتمل البث المجدول: أُرسل إلى ${sent} من ${recipients.length}.`
+      : `📢 تم إرسال البث إلى ${sent} من ${recipients.length}.`);
     return true;
   }
   await sendText(from, `ℹ️ مهمة /${type} تُشغَّل من بوت تيليجرام (وتعمل تلقائيًا كل 30 دقيقة أيضًا).`);
   return false;
+}
+
+// Cron tick worker: run the earliest due scheduled broadcast, if any.
+// Queue-after-current: when another broadcast is running
+// (BROADCAST_RUNNING_KEY set), do nothing this tick — the job waits for
+// the next tick. A job whose loop aborts early keeps its sent offset and
+// resumes from it on the next tick; a finished job is removed. Returns
+// true when a job was started, false otherwise.
+export async function runDueScheduledBroadcasts(env, { fetchImpl = globalThis.fetch, gapMs = MESSENGER_BROADCAST_GAP_MS, adminPsid = null } = {}) {
+  if (!env.USERS) return false;
+  let jobs = [];
+  try {
+    const stored = (await storeCall(env, { op: "get", key: SCHEDULED_BROADCAST_KEY })).value ?? [];
+    jobs = Array.isArray(stored) ? stored.filter((j) => j && typeof j.id === "string" && Number.isFinite(j.sendAt)) : [];
+  } catch {
+    return false;
+  }
+  const now = Date.now();
+  const due = jobs.filter((j) => j.status !== "done" && j.sendAt <= now).sort((a, b) => a.sendAt - b.sendAt);
+  if (!due.length) return false;
+  let running = null;
+  try { running = (await storeCall(env, { op: "get", key: BROADCAST_RUNNING_KEY })).value ?? null; } catch { running = null; }
+  if (running) return false; // a broadcast is running — wait for the next tick
+  const control = await broadcastControlState(env).catch(() => ({ paused: false }));
+  if (control?.paused) return false; // paused — the job stays queued
+  const job = due[0];
+  const admin = adminPsid ?? null;
+  const jobLabel = job.kind === "text"
+    ? String(job.text ?? "").slice(0, 60)
+    : job.kind === "video" ? "🎬 فيديو" : "📷 صورة";
+  const recipients = await messengerBroadcastRecipients(env).catch(() => []);
+  if (!recipients.length) {
+    await storeCall(env, { op: "put", key: SCHEDULED_BROADCAST_KEY, value: jobs.filter((j) => j.id !== job.id) }).catch(() => null);
+    if (admin) {
+      await sendMessengerMessage(env, admin, messengerTextMessage(`⏰ حان ميعاد الرسالة المجدولة «${jobLabel}» — لا يوجد مستخدمون لإرسالها إليهم، فتم إلغاؤها.`), fetchImpl).catch(() => null);
+    }
+    return true;
+  }
+  const saveProgress = async (sent) => {
+    const current = ((await storeCall(env, { op: "get", key: SCHEDULED_BROADCAST_KEY }).catch(() => null))?.value ?? []);
+    const list = Array.isArray(current) ? current : [];
+    const target = list.find((j) => j?.id === job.id);
+    if (target) {
+      target.sent = sent;
+      target.status = "sending";
+      await storeCall(env, { op: "put", key: SCHEDULED_BROADCAST_KEY, value: list }).catch(() => null);
+    }
+  };
+  // Mark sending before the loop starts, so /schedules shows it.
+  await saveProgress(Number(job.sent) || 0);
+  let done = false;
+  try {
+    done = await executeMessengerTask(env, {
+      type: "broadcast",
+      text: job.kind === "text" ? job.text : "",
+      mediaUrl: job.mediaUrl ?? "",
+      mediaKind: job.mediaKind ?? "image",
+      caption: job.caption ?? "",
+      from: admin,
+      scheduledId: job.id,
+      resilient: true,
+      resumeFrom: Number(job.sent) || 0,
+      onProgress: saveProgress,
+    }, admin, fetchImpl, { gapMs });
+  } catch {
+    done = false; // the job keeps its saved offset and resumes next tick
+  }
+  if (done) {
+    await storeCall(env, { op: "put", key: SCHEDULED_BROADCAST_KEY, value: jobs.filter((j) => j.id !== job.id) }).catch(() => null);
+  }
+  return true;
 }

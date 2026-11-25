@@ -76,6 +76,7 @@ import {
   setBroadcastControl,
   messengerBroadcastRecipients,
   executeMessengerTask,
+  runDueScheduledBroadcasts,
   logError,
   inBackground,
   sameSecret,
@@ -1815,9 +1816,17 @@ export default {
     return new Response("Not found", { status: 404 });
   },
 
-  // Keep-warm cron (*/5 * * * *): a no-op tick so a fresh isolate is warm
-  // when the next webhook arrives. No learn sync, no poller on this Worker.
+  // Cron (*/5 * * * *): the keep-warm tick ALSO runs due scheduled
+  // broadcasts (see /schedule in messenger-parity.js). The tick itself
+  // warms a fresh isolate, so the keep-warm effect stays; a due job is
+  // sent from here, at most ~5 minutes after its time (the cron grain).
+  // A broadcast already running makes the tick a no-op for scheduling.
   async scheduled(event, env, ctx) {
-    // no-op
+    const adminPsid = String(env.MESSENGER_ADMIN_PSID ?? "").split(",").map((s) => s.trim()).filter(Boolean)[0] ?? null;
+    const run = runDueScheduledBroadcasts(env, { adminPsid }).catch((error) => {
+      console.error("Scheduled broadcast tick failed", error instanceof Error ? error.message : "unknown");
+    });
+    if (ctx?.waitUntil) ctx.waitUntil(run);
+    else await run;
   },
 };
