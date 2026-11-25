@@ -500,13 +500,17 @@ function splitShareText(text, max = 1900) {
   return chunks;
 }
 
-// The /botcake handler sends this plan directly (image, then the text
-// chunks) — the envelope only carries three capped chunks, so the flow
-// would truncate the announcement.
+// /share — السطر الختامي بعد الصورة: دعوة النشر والمشاركة.
+export const SHARE_CLOSING_TEXT = "نرجو منك نشر ومشاركة البوست السابق في صفحتك وجروباتك ولكل احبائك ليستفيد الجميع من هذا العمل الضخم ❤️❤️😍";
+
+// The /botcake handler sends this plan directly (announcement chunks,
+// then the image, then the closing line) — the envelope only carries
+// three capped chunks, so the flow would truncate the announcement.
+// The LAST text is the closing line, sent after the image.
 export function sharePlan() {
   return {
     shareReply: true,
-    texts: splitShareText(SHARE_TEXT).map((text) => ({ text })),
+    texts: [...splitShareText(SHARE_TEXT), SHARE_CLOSING_TEXT].map((text) => ({ text })),
     voiceUrl: null,
     attachments: [{ type: "image", url: SHARE_POSTER_URL }],
   };

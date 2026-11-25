@@ -21,6 +21,7 @@ import {
   sharePlan,
   SHARE_TEXT,
   SHARE_POSTER_URL,
+  SHARE_CLOSING_TEXT,
   adminMenuText,
   lessonPlan,
   findLesson,
@@ -394,14 +395,16 @@ test("command displays: Arabic lines sit right (RLM), English/command lines sit 
 // /share — v2 launch announcement + poster
 // ---------------------------------------------------------------------------
 
-test("/share plan: poster image attachment + the full announcement in <=1900-char chunks; listed in menu, /start and /help", () => {
+test("/share plan: poster image attachment + the full announcement in <=1900-char chunks, closing line last; listed in menu, /start and /help", () => {
   const plan = sharePlan();
   assert.equal(plan.shareReply, true, "the /botcake handler direct-sends this plan");
   assert.deepEqual(plan.attachments, [{ type: "image", url: SHARE_POSTER_URL }]);
   assert.match(SHARE_POSTER_URL, /r2\.dev\/poster-v9\.jpg/u, "poster is the R2 upload");
-  assert.ok(plan.texts.length >= 2, "announcement splits into 2+ Messenger-safe chunks");
-  for (const t of plan.texts) assert.ok(t.text.length <= 1900, "each chunk fits the 1900-char split cap");
-  assert.equal(plan.texts.map((t) => t.text).join("\n"), SHARE_TEXT, "chunks rejoin to the full announcement verbatim");
+  const announcement = plan.texts.slice(0, -1).map((t) => t.text);
+  assert.ok(announcement.length >= 2, "announcement splits into 2+ Messenger-safe chunks");
+  for (const t of announcement) assert.ok(t.length <= 1900, "each chunk fits the 1900-char split cap");
+  assert.equal(announcement.join("\n"), SHARE_TEXT, "chunks rejoin to the full announcement verbatim");
+  assert.equal(plan.texts[plan.texts.length - 1].text, SHARE_CLOSING_TEXT, "the last text is the share-ask line, sent after the image");
   assert.match(SHARE_TEXT, /إطلاق النسخة الثانية من تطبيق القاموس القبطي الناطق/u);
   assert.match(SHARE_TEXT, /https:\/\/is\.gd\/copticdictionary/u);
   const menu = mainMenuText();

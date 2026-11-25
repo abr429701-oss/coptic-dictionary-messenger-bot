@@ -1605,20 +1605,12 @@ export default {
       // text chunk leaves the text fields so the flow tries them.
       if (plan?.shareReply) {
         try {
-          const imgUrl = Array.isArray(plan?.attachments)
-            ? (plan.attachments.find((a) => a?.type === "image" && a?.url)?.url ?? "")
-            : "";
-          let imgSent = false;
-          if (imgUrl) {
-            const imgRes = await sendMessengerMessage(env, input.psid, messengerAttachmentMessage("image", imgUrl), globalThis.fetch);
-            imgSent = Boolean(imgRes?.ok);
-            if (!imgSent) console.error("Botcake share image send failed", imgRes?.error ?? "unknown");
-          }
-          if (imgSent) {
-            envelope.image_url = "";
-            envelope.has_image = "no";
-          }
+          // Order (user's word, 25 Nov 2026): announcement chunks first,
+          // then the poster image, then the closing share-ask line — the
+          // last text in plan.texts is the closing line.
           const shareTexts = (Array.isArray(plan?.texts) ? plan.texts : []).map((t) => t?.text).filter(Boolean);
+          const announcement = shareTexts.slice(0, -1);
+          const closing = shareTexts.length ? shareTexts[shareTexts.length - 1] : "";
           let quickReplies = [];
           try {
             const parsed = envelope.quick_replies ? JSON.parse(envelope.quick_replies) : [];
@@ -1632,23 +1624,39 @@ export default {
               payload: title,
             }));
           }
+          const quickRepliesPayload = quickReplies.map((q) => ({
+            content_type: "text",
+            title: String(q.title ?? "").slice(0, 20),
+            payload: String(q.payload ?? ""),
+          }));
           let sentCount = 0;
-          for (let i = 0; i < shareTexts.length; i++) {
-            const isLast = i === shareTexts.length - 1;
-            const msg = { text: shareTexts[i] };
-            if (isLast && quickReplies.length) {
-              msg.quick_replies = quickReplies.map((q) => ({
-                content_type: "text",
-                title: String(q.title ?? "").slice(0, 20),
-                payload: String(q.payload ?? ""),
-              }));
-            }
-            const sent = await sendMessengerMessage(env, input.psid, msg, globalThis.fetch);
+          for (const text of announcement) {
+            const sent = await sendMessengerMessage(env, input.psid, { text }, globalThis.fetch);
             if (!sent.ok) {
               console.error("Botcake share text send failed", sent.error ?? "unknown");
               break;
             }
             sentCount++;
+          }
+          const imgUrl = Array.isArray(plan?.attachments)
+            ? (plan.attachments.find((a) => a?.type === "image" && a?.url)?.url ?? "")
+            : "";
+          let imgSent = false;
+          if (imgUrl) {
+            const imgRes = await sendMessengerMessage(env, input.psid, messengerAttachmentMessage("image", imgUrl), globalThis.fetch);
+            imgSent = Boolean(imgRes?.ok);
+            if (!imgSent) console.error("Botcake share image send failed", imgRes?.error ?? "unknown");
+          }
+          if (imgSent) {
+            envelope.image_url = "";
+            envelope.has_image = "no";
+          }
+          if (closing && sentCount === announcement.length) {
+            const msg = { text: closing };
+            if (quickRepliesPayload.length) msg.quick_replies = quickRepliesPayload;
+            const sent = await sendMessengerMessage(env, input.psid, msg, globalThis.fetch);
+            if (sent.ok) sentCount++;
+            else console.error("Botcake share text send failed", sent.error ?? "unknown");
           }
           if (sentCount === shareTexts.length) {
             envelope.text = "";
