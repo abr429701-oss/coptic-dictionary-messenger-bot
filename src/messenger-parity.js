@@ -481,6 +481,49 @@ https://t.me/Coptic2_bot
 Ebram Merzik
 ⲬⲎⲘⲒ | COPTIC DICTIONARY`;
 
+// /share — النسخة المختصرة (1,705 حرف) لماسنجر فقط: الإعلان الكامل
+// ~2,900 حرف ولا يدخل في رسالة ماسنجر واحدة (الحد 2000 حرف — جرّبناه
+// حي 25 نوفمبر 2026 ورفضته ميتا بالخطأ 100). تيليجرام وواتساب
+// يبقيان على النص الكامل SHARE_TEXT. وافق عليها المستخدم 25 نوفمبر 2026.
+export const SHARE_TEXT_SHORT = `إطلاق النسخة الثانية من تطبيق القاموس القبطي الناطق Ⲭⲏⲙⲓ | Coptic Dictionary 😍🎉
+
+يُسعدنا أن نقدم لكم النسخة الثانية من القاموس القبطي الناطق Ⲭⲏⲙⲓ، بإصدار أكثر تطوراً وشمولاً، يضم حوالي 17,000 كلمة متنوعة.
+
+📚 أبرز إمكانيات ومميزات القاموس:
+
+🔹 قاعدة بيانات موسّعة: حوالي 17,000 كلمة قبطية متنوعة.
+🔹 النطق الصوتي للكلمات: استمع إلى نطق المفردات القبطية وتعلمها بصورة عملية.
+🔹 واجهة بحث سهلة وسريعة للوصول إلى معاني الكلمات.
+🔹 يعمل على الأندرويد والموقع الإلكتروني وبوتات تيليجرام وماسنجر.
+
+📱 ميزة خاصة بتطبيق الأندرويد: حمّل الملفات الصوتية واحتفظ بها على جهازك، واستمع إلى نطق الكلمات في أي وقت حتى دون إنترنت، بعد تحميلها لأول مرة.
+
+🎧 الحجم الإجمالي للملفات الصوتية لا يتجاوز 40 ميجابايت فقط!
+
+⚠️ تنويه مهم: القاموس مرجع لغوي لمعاني الكلمات المفردة، وليس أداة لترجمة الجمل والنصوص الكاملة.
+
+📖 قسم جديد: الكتاب المقدس 😍 — نصوصه وترجماته بالقبطية والسريانية واليونانية والعبرية والإنجليزية.
+
+🔔 إشعارات يومية😍 — ومن أبرزها إشعار الكلمة القبطية اليومية، فعّل إشعارات التطبيق لتصلك كل يوم.
+
+📱 طرق استخدام القاموس القبطي Ⲭⲏⲙⲓ:
+
+1️⃣ تطبيق الأندرويد: https://is.gd/copticdictionary
+2️⃣ الموقع الإلكتروني: https://copticdictionry.neocities.org/
+3️⃣ بوت تيليجرام: https://t.me/Coptic_Dictionary_bot
+4️⃣ بوت ماسنجر: https://m.me/Copticdictionary
+
+📚 بوت تعلم اللغات القديمة (القبطية والهيروغليفية واليونانية):
+https://t.me/Coptic2_bot
+
+شاركوا هذا العمل مع أحبائكم وأصدقائكم والمهتمين باللغة القبطية والتراث المصري القديم، حتى تعم الفائدة😍❤️
+
+━━━━━━━━━━━━━━━━━━
+إذا تعذر عليك تحميل نسخة القاموس للأندرويد أو لديك أي استفسار، تواصل مع مبرمج القاموس واتساب: https://wa.me/@Ebram_El_masry أو تيليجرام: https://telegram.me/Abraam55، وسيتم إرسال نسخة ملف الـ APK جاهزة للتثبيت المباشر😍
+
+Ebram Merzik
+ⲬⲎⲘⲒ | COPTIC DICTIONARY`;
+
 // Messenger caps a text message at 2000 chars; split the announcement
 // at line boundaries into <=1900-char pieces.
 function splitShareText(text, max = 1900) {
@@ -503,18 +546,15 @@ function splitShareText(text, max = 1900) {
 // /share — السطر الختامي بعد الصورة: دعوة النشر والمشاركة.
 export const SHARE_CLOSING_TEXT = "نرجو منك نشر ومشاركة البوست السابق في صفحتك وجروباتك ولكل احبائك ليستفيد الجميع من هذا العمل الضخم ❤️❤️😍";
 
-// The /botcake handler sends this plan directly (announcement chunks,
-// then the image, then the closing line) — the envelope only carries
-// three capped chunks, so the flow would truncate the announcement.
-// The LAST text is the closing line, sent after the image.
-// NOTE: the announcement is ~2,900 chars and Meta caps one Messenger
-// text at 2000 — tested live 25 Nov 2026, Meta refused the unsplit
-// send with "(#100) Length of param message[text] must be less than
-// or equal to 2000", so the announcement MUST arrive in 2 chunks.
+// The /botcake handler sends this plan directly (announcement, then
+// the image, then the closing line) — the envelope only carries three
+// capped chunks, so the flow would truncate the announcement. The LAST
+// text is the closing line, sent after the image. The announcement here
+// is the SHORT version (fits one Messenger bubble, < 2000 chars).
 export function sharePlan() {
   return {
     shareReply: true,
-    texts: [...splitShareText(SHARE_TEXT), SHARE_CLOSING_TEXT].map((text) => ({ text })),
+    texts: [SHARE_TEXT_SHORT, SHARE_CLOSING_TEXT].map((text) => ({ text })),
     voiceUrl: null,
     attachments: [{ type: "image", url: SHARE_POSTER_URL }],
   };

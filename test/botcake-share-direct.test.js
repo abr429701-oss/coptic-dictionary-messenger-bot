@@ -101,7 +101,7 @@ test("/share: announcement text first, then poster image, then closing share-ask
   assert.equal(images.length, 1, "exactly one direct image send");
   assert.equal(images[0].body.message.attachment.payload.url, SHARE_POSTER_URL, "image is the R2 poster");
   const direct = directTextSends(calls);
-  assert.ok(direct.length >= 3, "announcement chunks + closing line");
+  assert.equal(direct.length, 2, "exactly two direct texts: the short announcement in one bubble + the closing line");
   const allDirect = direct.map((d) => d.body.message.text).join("\n");
   assert.match(allDirect, /إطلاق النسخة الثانية من تطبيق القاموس القبطي الناطق/u, "direct texts carry the announcement opening");
   assert.match(allDirect, /https:\/\/is\.gd\/copticdictionary/u, "direct texts carry the app link");

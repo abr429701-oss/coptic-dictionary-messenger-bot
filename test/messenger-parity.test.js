@@ -20,6 +20,7 @@ import {
   mainMenuText,
   sharePlan,
   SHARE_TEXT,
+  SHARE_TEXT_SHORT,
   SHARE_POSTER_URL,
   SHARE_CLOSING_TEXT,
   adminMenuText,
@@ -395,18 +396,19 @@ test("command displays: Arabic lines sit right (RLM), English/command lines sit 
 // /share — v2 launch announcement + poster
 // ---------------------------------------------------------------------------
 
-test("/share plan: poster image attachment + the full announcement in <=1900-char chunks, closing line last; listed in menu, /start and /help", () => {
+test("/share plan: poster image attachment + the short announcement in ONE bubble, closing line last; listed in menu, /start and /help", () => {
   const plan = sharePlan();
   assert.equal(plan.shareReply, true, "the /botcake handler direct-sends this plan");
   assert.deepEqual(plan.attachments, [{ type: "image", url: SHARE_POSTER_URL }]);
   assert.match(SHARE_POSTER_URL, /r2\.dev\/poster-v9\.jpg/u, "poster is the R2 upload");
-  const announcement = plan.texts.slice(0, -1).map((t) => t.text);
-  assert.ok(announcement.length >= 2, "announcement splits into 2+ Messenger-safe chunks");
-  for (const t of announcement) assert.ok(t.length <= 1900, "each chunk fits the 1900-char split cap");
-  assert.equal(announcement.join("\n"), SHARE_TEXT, "chunks rejoin to the full announcement verbatim");
-  assert.equal(plan.texts[plan.texts.length - 1].text, SHARE_CLOSING_TEXT, "the last text is the share-ask line, sent after the image");
-  assert.match(SHARE_TEXT, /إطلاق النسخة الثانية من تطبيق القاموس القبطي الناطق/u);
-  assert.match(SHARE_TEXT, /https:\/\/is\.gd\/copticdictionary/u);
+  // Messenger-only short version: the full announcement (~2,900 chars)
+  // cannot fit one bubble (Meta's cap is 2000 — proven live 25 Nov 2026).
+  assert.deepEqual(plan.texts.map((t) => t.text), [SHARE_TEXT_SHORT, SHARE_CLOSING_TEXT], "one announcement bubble, then the closing line");
+  assert.ok(SHARE_TEXT_SHORT.length < 2000, "short announcement fits one Messenger bubble");
+  assert.ok([...SHARE_TEXT_SHORT].length < 2000, "short announcement fits by code points too");
+  assert.ok(SHARE_TEXT.length > 2000, "the full announcement stays over the cap (Telegram/WhatsApp keep it)");
+  assert.match(SHARE_TEXT_SHORT, /إطلاق النسخة الثانية من تطبيق القاموس القبطي الناطق/u);
+  assert.match(SHARE_TEXT_SHORT, /https:\/\/is\.gd\/copticdictionary/u);
   const menu = mainMenuText();
   assert.match(menu, /7\. 📣 مشاركة الإعلان — إعلان إطلاق النسخة الثانية/u, "/share is menu item 7");
   const welcome = parityWelcomeText();
