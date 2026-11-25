@@ -1492,7 +1492,7 @@ export default {
       // exist (saved by this run) and Botcake sends as normal, so this
       // direct send only ever fires once per user. Awaited (like the
       // video/cert sends) so it lands before the envelope returns.
-      if (isFirstEver && envelope.text) {
+      if (isFirstEver && envelope.text && !plan?.shareReply) {
         try {
           let quickReplies = [];
           try {
@@ -1593,6 +1593,74 @@ export default {
           if (sentCount === chunks.length) envelope.quick_replies = "";
         } catch (error) {
           console.error("Botcake direct text send failed", error instanceof Error ? error.message : "unknown");
+        }
+      }
+      // /share (25 Nov 2026): the v2 launch announcement + poster. The
+      // announcement is ~2,900 chars — the envelope only carries three
+      // capped chunks, so the flow would truncate it (text3 is capped).
+      // Send the image first, then the full text chunks, directly
+      // (awaited), like the word-card fix above, and clear the envelope
+      // so the flow sends nothing (no double). A failed image send
+      // leaves image_url in the envelope as a flow fallback; a failed
+      // text chunk leaves the text fields so the flow tries them.
+      if (plan?.shareReply) {
+        try {
+          const imgUrl = Array.isArray(plan?.attachments)
+            ? (plan.attachments.find((a) => a?.type === "image" && a?.url)?.url ?? "")
+            : "";
+          let imgSent = false;
+          if (imgUrl) {
+            const imgRes = await sendMessengerMessage(env, input.psid, messengerAttachmentMessage("image", imgUrl), globalThis.fetch);
+            imgSent = Boolean(imgRes?.ok);
+            if (!imgSent) console.error("Botcake share image send failed", imgRes?.error ?? "unknown");
+          }
+          if (imgSent) {
+            envelope.image_url = "";
+            envelope.has_image = "no";
+          }
+          const shareTexts = (Array.isArray(plan?.texts) ? plan.texts : []).map((t) => t?.text).filter(Boolean);
+          let quickReplies = [];
+          try {
+            const parsed = envelope.quick_replies ? JSON.parse(envelope.quick_replies) : [];
+            if (Array.isArray(parsed)) quickReplies = parsed;
+          } catch {
+            /* no quick replies in the envelope */
+          }
+          if (!quickReplies.length) {
+            quickReplies = ["البداية", "تعلّم", "القائمة", "كلمة عشوائية", "تواصل معنا"].map((title) => ({
+              title,
+              payload: title,
+            }));
+          }
+          let sentCount = 0;
+          for (let i = 0; i < shareTexts.length; i++) {
+            const isLast = i === shareTexts.length - 1;
+            const msg = { text: shareTexts[i] };
+            if (isLast && quickReplies.length) {
+              msg.quick_replies = quickReplies.map((q) => ({
+                content_type: "text",
+                title: String(q.title ?? "").slice(0, 20),
+                payload: String(q.payload ?? ""),
+              }));
+            }
+            const sent = await sendMessengerMessage(env, input.psid, msg, globalThis.fetch);
+            if (!sent.ok) {
+              console.error("Botcake share text send failed", sent.error ?? "unknown");
+              break;
+            }
+            sentCount++;
+          }
+          if (sentCount === shareTexts.length) {
+            envelope.text = "";
+            envelope.text2 = "";
+            envelope.text3 = "";
+            envelope.has_text = "no";
+            envelope.has_text2 = "no";
+            envelope.has_text3 = "no";
+            envelope.quick_replies = "";
+          }
+        } catch (error) {
+          console.error("Botcake share send failed", error instanceof Error ? error.message : "unknown");
         }
       }
       // Voice cannot be sent from a Botcake flow: the Audio step is

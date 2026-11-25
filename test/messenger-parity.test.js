@@ -16,6 +16,11 @@ import {
   levelsText,
   levelMenuText,
   parityHelpText,
+  parityWelcomeText,
+  mainMenuText,
+  sharePlan,
+  SHARE_TEXT,
+  SHARE_POSTER_URL,
   adminMenuText,
   lessonPlan,
   findLesson,
@@ -383,6 +388,28 @@ test("command displays: Arabic lines sit right (RLM), English/command lines sit 
   const admin = adminMenuText();
   assert.doesNotMatch(admin, /\*/u, "admin menu carries no asterisks");
   assert.ok(admin.split("\n").some((l) => l === "\u200E/stats — الإحصاءات"), "quick commands one per line, in order");
+});
+
+// ---------------------------------------------------------------------------
+// /share — v2 launch announcement + poster
+// ---------------------------------------------------------------------------
+
+test("/share plan: poster image attachment + the full announcement in <=1900-char chunks; listed in menu, /start and /help", () => {
+  const plan = sharePlan();
+  assert.equal(plan.shareReply, true, "the /botcake handler direct-sends this plan");
+  assert.deepEqual(plan.attachments, [{ type: "image", url: SHARE_POSTER_URL }]);
+  assert.match(SHARE_POSTER_URL, /r2\.dev\/poster-v9\.jpg/u, "poster is the R2 upload");
+  assert.ok(plan.texts.length >= 2, "announcement splits into 2+ Messenger-safe chunks");
+  for (const t of plan.texts) assert.ok(t.text.length <= 1900, "each chunk fits the 1900-char split cap");
+  assert.equal(plan.texts.map((t) => t.text).join("\n"), SHARE_TEXT, "chunks rejoin to the full announcement verbatim");
+  assert.match(SHARE_TEXT, /إطلاق النسخة الثانية من تطبيق القاموس القبطي الناطق/u);
+  assert.match(SHARE_TEXT, /https:\/\/is\.gd\/copticdictionary/u);
+  const menu = mainMenuText();
+  assert.match(menu, /7\. 📣 مشاركة الإعلان — إعلان إطلاق النسخة الثانية/u, "/share is menu item 7");
+  const welcome = parityWelcomeText();
+  assert.ok(welcome.split("\n").some((l) => l === "\u200E/share — مشاركة إعلان النسخة الثانية"), "/start lists /share");
+  const help = parityHelpText();
+  assert.ok(help.split("\n").some((l) => l === "\u200E/share — مشاركة إعلان النسخة الثانية"), "/help lists /share");
 });
 
 // ---------------------------------------------------------------------------

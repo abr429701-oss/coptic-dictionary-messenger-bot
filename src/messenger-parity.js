@@ -360,6 +360,7 @@ export function mainMenuText() {
     "4. 🔑 الرقم الكودي — الحصول على الرقم الكودي",
     "5. ❓ مساعدة — عرض الأوامر",
     "6. 🔗 روابط المنصات — روابط التطبيق والموقع والبوتات",
+    "7. 📣 مشاركة الإعلان — إعلان إطلاق النسخة الثانية",
   ].join("\n"));
 }
 
@@ -370,6 +371,7 @@ export const MAIN_MENU_ITEMS = [
   { type: "getcode", label: "🔑 الرقم الكودي", payload: "learn|getcode" },
   { type: "help", label: "❓ مساعدة", payload: "learn|help" },
   { type: "links", label: "🔗 روابط المنصات", payload: "learn|links" },
+  { type: "share", label: "📣 مشاركة الإعلان", payload: "learn|share" },
 ];
 
 export function parityWelcomeText() {
@@ -380,6 +382,7 @@ export function parityWelcomeText() {
     "/learn — تعلم اللغة القبطية من بوت منفصل",
     "/learnhere — تعلم اللغة القبطية هنا",
     "/links — روابط المنصات (التطبيق والموقع والبوتات)",
+    "/share — مشاركة إعلان النسخة الثانية",
     "/cert — الحصول على الشهادة",
     "/getcode — الحصول على الرقم الكودي",
     "/help — المساعدة",
@@ -398,6 +401,7 @@ export function parityHelpText() {
     "القائمة:",
     "/learnhere — تعلم اللغة القبطية هنا",
     "/links — روابط المنصات (التطبيق والموقع والبوتات)",
+    "/share — مشاركة إعلان النسخة الثانية",
     "/start — بدء الاستخدام",
     "",
     "الدروس فيديو وصور من تطبيق التعلم، والامتحانات برابط تفتحه من المتصفح بعد إدخال رقمك الكودي.",
@@ -418,6 +422,95 @@ export const LINKS_TEXT = [
   "💬 ماسنجر: https://m.me/Copticdictionary",
   "🟢 واتساب: https://wa.me/message/WSYPILDL7WV7C1",
 ].join("\n");
+
+// /share — إعلان إطلاق النسخة الثانية (نص طويل + صورة البوستر).
+// النص حرفيًا كما كتبه المستخدم؛ الصورة مرفوعة على R2. مثل LINKS_TEXT،
+// لا يمر عبر directLines: أول حرف قوي في السطور عربي، فتظهر كما هي.
+export const SHARE_POSTER_URL = "https://pub-e39b5be260724e0ea1bbf6a7db089987.r2.dev/poster-v9.jpg";
+export const SHARE_TEXT = `إطلاق النسخة الثانية من تطبيق القاموس القبطي الناطق Ⲭⲏⲙⲓ | Coptic Dictionary 😍🎉
+
+بعد إطلاق النسخة الأولى التجريبية، يُسعدنا أن نقدم لكم النسخة الثانية من القاموس القبطي الناطق Ⲭⲏⲙⲓ، بإصدار أكثر تطوراً وشمولاً، يضم حوالي 17,000 كلمة متنوعة، إلى جانب مجموعة من المميزات والإضافات الجديدة التي تهدف إلى تسهيل تعلم اللغة القبطية والبحث في مفرداتها.
+
+📚 أبرز إمكانيات ومميزات القاموس:
+
+🔹 قاعدة بيانات لغوية موسّعة: تضم حوالي 17,000 كلمة قبطية متنوعة، لتوفير مرجع لغوي واسع للبحث والتعلم.
+
+🔹 النطق الصوتي للكلمات: إمكانية الاستماع إلى النطق الصوتي للمفردات القبطية، مما يساعد على التعرف على نطق الكلمات وتعلمها بصورة عملية.
+
+🔹 واجهة بحث سهلة وسريعة: إمكانية البحث عن الكلمات والوصول إلى معانيها من خلال واجهة استخدام بسيطة وميسرة.
+
+🔹 دعم منصات متعددة: إمكانية استخدام القاموس من خلال تطبيق الأندرويد أو الموقع الإلكتروني أو بوتات تيليجرام وماسنجر.
+
+📱 ميزة خاصة بتطبيق الأندرويد: من أبرز المميزات التي ينفرد بها تطبيق الأندرويد إمكانية تحميل الملفات الصوتية والاحتفاظ بها على جهازك، لتتمكن من الاستماع إلى نطق الكلمات القبطية في أي وقت، حتى دون الحاجة إلى الاتصال بالإنترنت، وذلك بعد تحميلها لأول مرة، وهذه الميزة متاحة داخل تطبيق الأندرويد، لتمنح مستخدميه تجربة مختلفة عن استخدام القاموس من خلال البوتات.
+
+🎧 والأفضل من ذلك أن الحجم الإجمالي للملفات الصوتية لا يتجاوز 40 ميجابايت فقط!
+
+⚠️ تنويه مهم: القاموس مرجع لغوي متخصص في عرض معاني الكلمات المفردة، وليس أداة لترجمة الجمل والنصوص الكاملة.
+
+📖 إضافة قسم جديد: الكتاب المقدس 😍
+إضافة قسم مميز للكتاب المقدس، يتيح الاطلاع على نصوصه وترجماته باللغات المختلفة، وفي مقدمتها اللغة القبطية، إلى جانب لغات أخرى مثل السريانية واليونانية والعبرية والإنجليزية. 😍
+
+🔔 نظام الإشعارات اليومية😍
+إضافة مجموعة متنوعة من الإشعارات اليومية وإشعارات المناسبات، ومن أبرزها إشعار الكلمة القبطية اليومية، بهدف تعزيز التعلم المستمر والتفاعل مع اللغة والتراث القبطي، ولتعمل هذه الميزة لديك، قُم بتفعيل الاشعارات للتطبيق.
+
+✨ تحسينات وإضافات جديدة
+العديد من التحسينات والتطويرات والمميزات الإضافية التي ندعوكم لاكتشافها بأنفسكم!
+
+📱 طرق استخدام القاموس القبطي Ⲭⲏⲙⲓ:
+
+1️⃣ تطبيق الأندرويد:
+https://is.gd/copticdictionary
+
+2️⃣ الموقع الإلكتروني:
+https://copticdictionry.neocities.org/
+
+3️⃣ بوت تيليجرام للقاموس:
+https://t.me/Coptic_Dictionary_bot
+
+4️⃣ بوت ماسنجر للقاموس:
+https://m.me/Copticdictionary
+
+📚 وأيضاً بوت تعلم اللغات القديمة: يمكنكم أيضاً الاستفادة من بوت مخصص لتعلم اللغة القبطية والهيروغليفية واليونانية:
+https://t.me/Coptic2_bot
+
+وندعوكم لمشاركة هذا العمل مع جميع أحبائكم وأصدقائكم والمهتمين باللغة القبطية والتراث المصري القديم، للمساهمة في نشر المعرفة وإيصال هذا المشروع إلى أكبر عدد ممكن من المهتمين، حتى تعم الفائدة😍❤️
+
+━━━━━━━━━━━━━━━━━━
+وإذا تعذر عليك تحميل نسخة القاموس للاندرويد أو لديك أي استفسار، يمكنك التواصل مع مبرمج القاموس من خلال الواتساب: https://wa.me/@Ebram_El_masry أو من خلال التيليجرام: https://telegram.me/Abraam55 وسيتم ارسال لك نسخة ملف الـ APK جاهزة للتثبيت المباشر😍
+
+Ebram Merzik
+ⲬⲎⲘⲒ | COPTIC DICTIONARY`;
+
+// Messenger caps a text message at 2000 chars; split the announcement
+// at line boundaries into <=1900-char pieces.
+function splitShareText(text, max = 1900) {
+  const lines = String(text ?? "").split("\n");
+  const chunks = [];
+  let cur = "";
+  for (const line of lines) {
+    const add = cur ? "\n" + line : line;
+    if (cur && cur.length + add.length > max) {
+      chunks.push(cur);
+      cur = line;
+    } else {
+      cur += add;
+    }
+  }
+  if (cur) chunks.push(cur);
+  return chunks;
+}
+
+// The /botcake handler sends this plan directly (image, then the text
+// chunks) — the envelope only carries three capped chunks, so the flow
+// would truncate the announcement.
+export function sharePlan() {
+  return {
+    shareReply: true,
+    texts: splitShareText(SHARE_TEXT).map((text) => ({ text })),
+    voiceUrl: null,
+    attachments: [{ type: "image", url: SHARE_POSTER_URL }],
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Certificate result -> plan (mirrors Telegram's handleCertCode, with the
@@ -1557,6 +1650,7 @@ export function createMessengerParity(deps = {}) {
       if (item.type === "getcode") return beginGetCodeFlow(senderId, state);
       if (item.type === "help") return textPlan(parityHelpText());
       if (item.type === "links") return textPlan(LINKS_TEXT);
+      if (item.type === "share") return sharePlan();
       return textPlan("⚠️ اختيار غير معروف.");
     }
     if (list?.kind === "cert-level") return beginCertFlow(senderId, state, item.level);
@@ -3012,6 +3106,8 @@ export function createMessengerParity(deps = {}) {
           return mainMenuPlan(senderId, state);
         case "links":
           return textPlan(LINKS_TEXT);
+        case "share":
+          return sharePlan();
         case "learn":
           await commit(senderId, state, { ...clearFlows });
           return levelsPlan(senderId, state);
@@ -3141,6 +3237,7 @@ export function createMessengerParity(deps = {}) {
     }
     if (raw === "learn|help") return textPlan(parityHelpText());
     if (raw === "learn|links") return textPlan(LINKS_TEXT);
+    if (raw === "learn|share") return sharePlan();
     return null;
   }
 
