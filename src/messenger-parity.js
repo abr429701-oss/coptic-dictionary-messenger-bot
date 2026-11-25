@@ -507,6 +507,10 @@ export const SHARE_CLOSING_TEXT = "نرجو منك نشر ومشاركة الب�
 // then the image, then the closing line) — the envelope only carries
 // three capped chunks, so the flow would truncate the announcement.
 // The LAST text is the closing line, sent after the image.
+// NOTE: the announcement is ~2,900 chars and Meta caps one Messenger
+// text at 2000 — tested live 25 Nov 2026, Meta refused the unsplit
+// send with "(#100) Length of param message[text] must be less than
+// or equal to 2000", so the announcement MUST arrive in 2 chunks.
 export function sharePlan() {
   return {
     shareReply: true,
