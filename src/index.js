@@ -1523,19 +1523,21 @@ export default {
           console.error("Botcake first-user direct send failed", error instanceof Error ? error.message : "unknown");
         }
       }
-      // Word cards, name completions and get-code replies: send the text
-      // directly (awaited), like the voice below. Live bug 23 Nov 2026:
-      // picking a suggestion returns only the voice — the flow drops the
-      // card text on pick turns (it reads its saved reply fields one run
-      // stale), while the voice, sent directly by the Worker, always
-      // arrives. Same bug, second face: after a new user types their
-      // name, the welcome + help text never arrives at all (the name IS
-      // saved, the envelope is correct, the Worker just never sends it
-      // directly and the flow drops it). Same bug, third face (24 Nov
-      // 2026): after a user types their name + phone for get-code, the
-      // code reply never arrives — the envelope is correct, the Worker
-      // sent nothing directly, the flow drops it. Sending the text
-      // directly too makes all three complete. On success the envelope
+      // Word cards, name completions, get-code replies and coptic-name
+      // replies: send the text directly (awaited), like the voice below.
+      // Live bug 23 Nov 2026: picking a suggestion returns only the
+      // voice — the flow drops the card text on pick turns (it reads its
+      // saved reply fields one run stale), while the voice, sent directly
+      // by the Worker, always arrives. Same bug, second face: after a new
+      // user types their name, the welcome + help text never arrives at
+      // all (the name IS saved, the envelope is correct, the Worker just
+      // never sends it directly and the flow drops it). Same bug, third
+      // face (24 Nov 2026): after a user types their name + phone for
+      // get-code, the code reply never arrives — the envelope is correct,
+      // the Worker sent nothing directly, the flow drops it. Same bug,
+      // fourth face (27 Nov 2026): /copticname's ask/answer would drop
+      // the same way, so its plans ride the direct send too. Sending the
+      // text directly too makes all four complete. On success the envelope
       // text is cleared so the flow sends nothing (no double); a chunk
       // that fails to send stays in the envelope so the flow tries it as
       // a fallback. Skipped for first-ever users (the direct send above
@@ -1549,7 +1551,7 @@ export default {
       // menu), which the envelope already holds, so they ride instead.
       // A get-code reply likewise carries no replies, so it gets the
       // five fixed buttons too.
-      if ((plan?.wordCard || plan?.nameCompleted || plan?.getCodeReply) && envelope.text && !isFirstEver) {
+      if ((plan?.wordCard || plan?.nameCompleted || plan?.getCodeReply || plan?.copticNameReply) && envelope.text && !isFirstEver) {
         try {
           let quickReplies = [];
           try {

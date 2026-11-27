@@ -74,6 +74,7 @@ import {
   buildGetCodeReply,
   getCodePhoneValid,
 } from "./getcode.js";
+import { copticNameReply } from "./coptic-name.js";
 import { buildQuickReplies, plainTextCard } from "./messenger.js";
 import { parseScheduleTime, formatCairoDateTime } from "./schedule-time.js";
 import { PARKED_DISPATCH_MESSAGES } from "./dispatch-commands.js";
@@ -362,6 +363,7 @@ export function mainMenuText() {
     "5. ❓ مساعدة — عرض الأوامر",
     "6. 🔗 روابط المنصات — روابط التطبيق والموقع والبوتات",
     "7. 📣 مشاركة الإعلان — إعلان إطلاق النسخة الثانية",
+    "8. ✍️ اكتب اسمك بالقبطية",
   ].join("\n"));
 }
 
@@ -373,6 +375,7 @@ export const MAIN_MENU_ITEMS = [
   { type: "help", label: "❓ مساعدة", payload: "learn|help" },
   { type: "links", label: "🔗 روابط المنصات", payload: "learn|links" },
   { type: "share", label: "📣 مشاركة الإعلان", payload: "learn|share" },
+  { type: "copticname", label: "✍️ اكتب اسمك بالقبطية", payload: "learn|copticname" },
 ];
 
 export function parityWelcomeText() {
@@ -384,6 +387,7 @@ export function parityWelcomeText() {
     "/learnhere — تعلم اللغة القبطية هنا",
     "/links — روابط المنصات (التطبيق والموقع والبوتات)",
     "/share — مشاركة إعلان النسخة الثانية",
+    "/copticname — اكتب اسمك بالحروف القبطية",
     "/cert — الحصول على الشهادة",
     "/getcode — الحصول على الرقم الكودي",
     "/help — المساعدة",
@@ -403,6 +407,7 @@ export function parityHelpText() {
     "/learnhere — تعلم اللغة القبطية هنا",
     "/links — روابط المنصات (التطبيق والموقع والبوتات)",
     "/share — مشاركة إعلان النسخة الثانية",
+    "/copticname — اكتب اسمك بالحروف القبطية",
     "/start — بدء الاستخدام",
     "",
     "الدروس فيديو وصور من تطبيق التعلم، والامتحانات برابط تفتحه من المتصفح بعد إدخال رقمك الكودي.",
@@ -1160,7 +1165,8 @@ export function createMessengerParity(deps = {}) {
 
   const clearFlows = {
     certAwaiting: undefined, getcodeStep: undefined, getcodeName: undefined,
-    examAwaiting: undefined, pendingBroadcast: undefined, pendingConfirm: undefined, menuList: undefined,
+    examAwaiting: undefined, copticNameAwaiting: undefined,
+    pendingBroadcast: undefined, pendingConfirm: undefined, menuList: undefined,
     recordState: undefined, recordPick: undefined, scheduleFlow: undefined,
   };
 
@@ -1452,6 +1458,25 @@ export function createMessengerParity(deps = {}) {
       ...clearFlows, getcodeStep: "name", getcodeName: undefined,
     });
     return textPlan("✏️ اكتب اسمك الثلاثي:");
+  }
+
+  // /copticname — كتابة الاسم بالحروف القبطية (طلب المستخدم 27 نوفمبر 2026).
+  // نفس المنطق في التليجرام والواتساب: الأمر لوحده يسأل عن الاسم،
+  // و/copticname <اسم> يجاوب فورًا. الترجمة نفسها في coptic-name.js
+  // (مشتركة مع التليجرام). الخطط موسومة copticNameReply: true فيُرسلها
+  // الـ Worker مباشرة (نفس علاج get-code) بدل ما تضيع في تدفق Botcake.
+  async function beginCopticNameFlow(senderId, state) {
+    await commit(senderId, state, { ...clearFlows, copticNameAwaiting: true });
+    return { ...textPlan("✍️ اكتب اسمك بالعربي أو بالإنجليزي:"), copticNameReply: true };
+  }
+
+  async function handleCopticNameStep(senderId, state, text) {
+    const reply = copticNameReply(text);
+    if (!reply) {
+      return { ...textPlan("⚠️ اكتب اسم صحيح بالعربي أو بالإنجليزي، أو /cancel للإلغاء."), copticNameReply: true };
+    }
+    await commit(senderId, state, { copticNameAwaiting: undefined });
+    return { ...textPlan(reply), copticNameReply: true };
   }
 
   async function handleGetCodeStep(senderId, state, text) {
@@ -1794,6 +1819,7 @@ export function createMessengerParity(deps = {}) {
       if (item.type === "help") return textPlan(parityHelpText());
       if (item.type === "links") return textPlan(LINKS_TEXT);
       if (item.type === "share") return sharePlan();
+      if (item.type === "copticname") return beginCopticNameFlow(senderId, state);
       return textPlan("⚠️ اختيار غير معروف.");
     }
     if (list?.kind === "cert-level") return beginCertFlow(senderId, state, item.level);
@@ -3222,6 +3248,9 @@ export function createMessengerParity(deps = {}) {
       if (state.examAwaiting) {
         return handleExamCode(senderId, state, text);
       }
+      if (state.copticNameAwaiting) {
+        return handleCopticNameStep(senderId, state, text);
+      }
     }
 
     // Bare-number pick from the live menu (Arabic-Indic digits folded).
@@ -3313,6 +3342,15 @@ export function createMessengerParity(deps = {}) {
           return textPlan(LINKS_TEXT);
         case "share":
           return sharePlan();
+        case "copticname": {
+          if (arg) {
+            const reply = copticNameReply(arg);
+            return reply
+              ? { ...textPlan(reply), copticNameReply: true }
+              : { ...textPlan("⚠️ اكتب اسم صحيح بالعربي أو بالإنجليزي."), copticNameReply: true };
+          }
+          return beginCopticNameFlow(senderId, state);
+        }
         case "learn":
           await commit(senderId, state, { ...clearFlows });
           return levelsPlan(senderId, state);
@@ -3326,6 +3364,10 @@ export function createMessengerParity(deps = {}) {
         case "getcode":
           return beginGetCodeFlow(senderId, state);
         case "cancel": {
+          if (state.copticNameAwaiting) {
+            await commit(senderId, state, { copticNameAwaiting: undefined });
+            return textPlan("✅ تم إلغاء كتابة الاسم بالقبطية.");
+          }
           await commit(senderId, state, { ...clearFlows, lastLessonId: undefined, lastLevelId: undefined });
           return textPlan("تم الإلغاء ✅\nأرسل /menu لعرض القائمة.");
         }

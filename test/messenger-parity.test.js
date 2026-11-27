@@ -418,6 +418,44 @@ test("/share plan: poster image attachment + the short announcement in ONE bubbl
 });
 
 // ---------------------------------------------------------------------------
+// /copticname — write your name in Coptic letters
+// ---------------------------------------------------------------------------
+
+test("/copticname asks for the name, then answers it in Coptic; /copticname <name> answers at once", async () => {
+  const parity = makeParity();
+  const ask = await parity.handleText(USER_PSID, "/copticname");
+  assert.equal(ask.texts[0].text, "✍️ اكتب اسمك بالعربي أو بالإنجليزي:");
+  assert.equal(ask.copticNameReply, true, "the ask rides the Worker's direct send, like get-code");
+  const answer = await parity.handleText(USER_PSID, "ابرام");
+  assert.equal(answer.texts[0].text, "كتابة اسمك بالقبطية: Ⲁⲃⲣⲁⲙ");
+  assert.equal(answer.copticNameReply, true, "the answer rides the direct send too");
+  // Inline form, Arabic and English.
+  assert.equal((await parity.handleText(USER_PSID, "/copticname مينا")).texts[0].text, "كتابة اسمك بالقبطية: Ⲙⲏⲛⲁ");
+  assert.equal((await parity.handleText(USER_PSID, "/copticname Shenouda")).texts[0].text, "كتابة اسمك بالقبطية: Ϣⲉⲛⲟⲩϯⲁ");
+  assert.equal((await parity.handleText(USER_PSID, "/copticname 123")).texts[0].text, "⚠️ اكتب اسم صحيح بالعربي أو بالإنجليزي.");
+});
+
+test("/copticname: an invalid name keeps the flow open; /cancel leaves it; listed in menu, /start and /help", async () => {
+  const parity = makeParity();
+  await parity.handleText(USER_PSID, "/copticname");
+  const bad = await parity.handleText(USER_PSID, "12345");
+  assert.equal(bad.texts[0].text, "⚠️ اكتب اسم صحيح بالعربي أو بالإنجليزي، أو /cancel للإلغاء.");
+  const good = await parity.handleText(USER_PSID, "كيرلس");
+  assert.equal(good.texts[0].text, "كتابة اسمك بالقبطية: Ⲕⲩⲣⲓⲗⲗⲟⲥ");
+  await parity.handleText(USER_PSID, "/copticname");
+  const cancelled = await parity.handleText(USER_PSID, "/cancel");
+  assert.equal(cancelled.texts[0].text, "✅ تم إلغاء كتابة الاسم بالقبطية.");
+  // Menu entry: appended as item 8, existing numbers unchanged.
+  const menu = mainMenuText();
+  assert.match(menu, /7\. 📣 مشاركة الإعلان — إعلان إطلاق النسخة الثانية/u, "/share stays item 7");
+  assert.match(menu, /8\. ✍️ اكتب اسمك بالقبطية/u, "/copticname is menu item 8");
+  const welcome = parityWelcomeText();
+  assert.ok(welcome.split("\n").some((l) => l === "\u200E/copticname — اكتب اسمك بالحروف القبطية"), "/start lists /copticname");
+  const help = parityHelpText();
+  assert.ok(help.split("\n").some((l) => l === "\u200E/copticname — اكتب اسمك بالحروف القبطية"), "/help lists /copticname");
+});
+
+// ---------------------------------------------------------------------------
 // Get-code
 // ---------------------------------------------------------------------------
 
