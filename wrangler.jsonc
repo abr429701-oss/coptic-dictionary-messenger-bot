@@ -23,6 +23,13 @@
   // reads it back over the public base URL, never through this binding;
   // the binding exists only so the Worker can PUT a new recording.
   "r2_buckets": [{ "binding": "RECORDINGS", "bucket_name": "coptic-lessons" }],
+  // Service binding to the Telegram Worker (28 Nov 2026): a Worker
+  // CANNOT fetch another Worker on the same account via its
+  // *.workers.dev URL — Cloudflare refuses it with error 1042 (HTTP
+  // 404), so the shared get-code registry was unreachable from here
+  // and every lookup silently missed. The binding calls the Telegram
+  // Worker directly, bypassing the public edge entirely.
+  "services": [{ "binding": "TELEGRAM_BOT", "service": "coptic-dictionary-bot" }],
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["UserStore"] }],
   "observability": {
     "enabled": true

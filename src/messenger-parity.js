@@ -1118,6 +1118,10 @@ export function createMessengerParity(deps = {}) {
     // runs exactly as before (fail open).
     getcodeRegistryBaseUrl = GETCODE_REGISTRY_BASE_URL,
     getcodeRegistrySecret = null,
+    // Registry calls go through the Telegram-Worker service binding
+    // (28 Nov 2026): a *.workers.dev fetch from this Worker is refused
+    // with Cloudflare error 1042. Null = fall back to fetchImpl.
+    registryFetchImpl = null,
     searchWords = null, // (query) => [{ id, coptic, pronunciation, english, meaning }] — for /record_choose
     nextUnrecorded = null, // (recordedIds:Set<string>) => { id, coptic, ... , recorded, total } | null — for /record
     getBroadcastControl = null, // () => { paused, speed } | null
@@ -1200,10 +1204,10 @@ export function createMessengerParity(deps = {}) {
   };
 
   // Shared get-code registry call options (28 Nov 2026): the Telegram
-  // Worker base URL + the shared secret + the injected fetch (tests
-  // stub it; production passes globalThis.fetch). Without a secret the
+  // Worker base URL + the shared secret + the binding fetch (tests
+  // stub it; production passes the service-binding fetch). Without a secret the
   // client never calls — every lookup is a miss, writes are skipped.
-  const registryOpts = () => ({ baseUrl: getcodeRegistryBaseUrl, secret: getcodeRegistrySecret, fetchImpl });
+  const registryOpts = () => ({ baseUrl: getcodeRegistryBaseUrl, secret: getcodeRegistrySecret, fetchImpl: registryFetchImpl ?? fetchImpl });
 
   // -- voice recording (/record) -------------------------------------------
   // Telegram's /record flow (final-code-fix src/index.js), adapted:

@@ -1119,6 +1119,33 @@ export default {
       return new Response(challenge, { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
     }
     // -- One brain, two transports ----------------------------------------
+    // Service binding to the Telegram Worker (28 Nov 2026): a Worker
+    // cannot fetch another Worker on the same account via its
+    // *.workers.dev URL — Cloudflare refuses it with error 1042 (HTTP
+    // 404), so the shared get-code registry was unreachable from here
+    // and every lookup silently missed (fail open). When the binding
+    // exists, registry calls go through it (relative path, straight to
+    // the Telegram Worker's fetch handler); otherwise the public fetch
+    // is used (works from outside Cloudflare, e.g. tests).
+    function registryFetchImplFor(env) {
+      if (env?.TELEGRAM_BOT) {
+        return async (url, options = {}) => {
+          const u = new URL(String(url));
+          // Service bindings need an ABSOLUTE URL (a relative path
+          // throws) — the host is ignored, the binding routes to the
+          // Telegram Worker. No AbortSignal in the init (bindings
+          // reject it). The binding is internal (fast), so no timeout
+          // is needed here.
+          return env.TELEGRAM_BOT.fetch(new Request("https://telegram-bot.internal" + u.pathname + u.search, {
+            method: options.method ?? "GET",
+            headers: options.headers,
+            body: options.body,
+          }));
+        };
+      }
+      return globalThis.fetch;
+    }
+
     // The webhook and POST /botcake share this wiring (parity brain +
     // live-monitor hook + planFor). Built lazily per request so the GET
     // routes never pay the drive-config read.
@@ -1242,6 +1269,11 @@ export default {
           }
         },
         fetchImpl: globalThis.fetch,
+        // Shared get-code registry calls go through the Telegram-Worker
+        // service binding (28 Nov 2026) — a *.workers.dev fetch from
+        // here is refused with Cloudflare error 1042. The plain
+        // fetchImpl above stays public (audio + OCR downloads).
+        registryFetchImpl: registryFetchImplFor(env),
         // Get-code screenshot OCR (28 Nov 2026): the OCR.space free key
         // from the OCR_SPACE_API_KEY wrangler secret; unset = OCR
         // skipped (fail open). The parent sets the secret after deploy.
