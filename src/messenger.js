@@ -479,11 +479,14 @@ export async function handleMessengerMessaging(env, event, planFor, fetchImpl = 
       // attachment with no text: a photo — only the get-code screenshot
       // wait owns it (planFor.image answers, or null); anything else
       // stays silent here, as photos did before. planFor.audio decides
-      // whether a session owns the voice turn.
+      // whether a session owns the voice turn. A sticker (incl. the 👍
+      // like) is an "image" attachment with a sticker_id — it is NOT a
+      // photo and never reaches planFor.image, so it can never confirm
+      // the get-code activation.
       const audio = message.attachments.find((a) => a?.type === "audio");
       if (audio && typeof planFor.audio === "function") plan = await planFor.audio(audio, senderId);
       else if (typeof planFor.image === "function") {
-        const image = message.attachments.find((a) => a?.type === "image");
+        const image = message.attachments.find((a) => a?.type === "image" && !a?.payload?.sticker_id);
         if (image) plan = await planFor.image(image, senderId);
       }
     }

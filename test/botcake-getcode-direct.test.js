@@ -10,7 +10,7 @@
 // silence instead of the registration instructions.
 import test from "node:test";
 import assert from "node:assert/strict";
-import worker, { UserStore } from "../src/index.js";
+import worker, { UserStore, isBotcakeImageUrlText } from "../src/index.js";
 import { MESSENGER_SEND_URL } from "../src/messenger.js";
 
 const BOTCAKE_SECRET = "test-botcake-secret";
@@ -260,4 +260,237 @@ test("get-code screenshot: empty-text turn with OCR key set still activates, nev
   assert.equal(direct.length, 1, "exactly one activation reply");
   assert.match(direct[0].body.message.text, /تم تفعيل اشتراكك عزيزنا أحمد محمد والرقم الكودي الخاص بك هو: 90488651/u);
   assert.ok(!calls.some((c) => String(c.url).startsWith("https://api.ocr.space/")), "no OCR call without image bytes");
+});
+
+// ---------------------------------------------------------------------------
+// Screenshot bug (live 28 Nov 2026, admin report): sending the screenshot on
+// Messenger searched the dictionary instead of completing the activation.
+// Root cause: Botcake forwards a photo as its Facebook CDN URL as the
+// message text, so the turn carried a non-empty text, the empty-text
+// image hook never fired, and the URL was searched as a dictionary word.
+// Fix: an image-URL text is an image turn (the URL goes to handleImage so
+// OCR can download it, exactly like the webhook path); an image-like turn
+// with no owner stays silent — a URL is never searched.
+// ---------------------------------------------------------------------------
+
+const FBCDN_PHOTO_URL = "https://scontent.fcai1-2.fna.fbcdn.net/v/t39.30808-6/123456789_987654321.jpg?_nc_cat=1&ccb=1-7";
+
+test("isBotcakeImageUrlText: fbcdn/scontent URLs and image extensions only", () => {
+  assert.equal(isBotcakeImageUrlText(FBCDN_PHOTO_URL), true, "Facebook CDN photo URL is an image turn");
+  assert.equal(isBotcakeImageUrlText("https://scontent.xx.fbcdn.net/v/photo.png"), true, "scontent host is an image turn");
+  assert.equal(isBotcakeImageUrlText("https://example.com/photo.jpg"), true, "image extension is an image turn");
+  assert.equal(isBotcakeImageUrlText("https://example.com/some-page"), false, "a plain page link is not an image turn");
+  assert.equal(isBotcakeImageUrlText("https://example.com/page?x=1"), false, "a link with a query is not an image turn");
+  assert.equal(isBotcakeImageUrlText("نور"), false, "a word is not an image turn");
+  assert.equal(isBotcakeImageUrlText(""), false, "empty text is not an image turn");
+  assert.equal(isBotcakeImageUrlText(null), false, "null is not an image turn");
+});
+
+// Fetch stub for the URL-turn tests: the macro, the fbcdn image download,
+// the OCR.space call (configurable OCR text), and the Send API.
+function ocrRecordingFetch(calls, { macroResponse, ocrText }) {
+  return async (url, options = {}) => {
+    const urlStr = String(url);
+    let body = null;
+    try { body = JSON.parse(options.body ?? "null"); } catch { body = null; }
+    calls.push({ url: urlStr, method: options.method ?? "GET", body });
+    if (urlStr === MACRO_URL) return Response.json(macroResponse);
+    if (urlStr.startsWith("https://api.ocr.space/")) {
+      return Response.json({ OCRExitCode: 1, IsErroredOnProcessing: false, ParsedResults: [{ ParsedText: ocrText }] });
+    }
+    if (urlStr.includes("fbcdn.net")) {
+      return new Response(new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3]), { status: 200, headers: { "content-type": "image/jpeg" } });
+    }
+    return Response.json({ recipient_id: PSID, message_id: "mid.test-1" });
+  };
+}
+
+async function postBotcakeWithFetch(body, kv, fetchImpl, envExtra = {}) {
+  const restoreFetch = globalThis.fetch;
+  globalThis.fetch = fetchImpl;
+  const tasks = [];
+  const ctx = { waitUntil: (p) => { tasks.push(p); return p; } };
+  try {
+    const response = await worker.fetch(new Request("https://bot.test/botcake", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-botcake-secret": BOTCAKE_SECRET },
+      body: JSON.stringify(body),
+    }), {
+      BOTCAKE_SECRET,
+      MESSENGER_PAGE_TOKEN: PAGE_TOKEN,
+      APPS_SCRIPT_URL: MACRO_URL,
+      USERS: kv,
+      RECORDED_AUDIO_BASE_URL: "https://example.r2.dev",
+      ...envExtra,
+    }, ctx);
+    assert.equal(response.status, 200);
+    const envelope = await response.json();
+    await Promise.allSettled(tasks);
+    return { envelope, tasks };
+  } finally {
+    globalThis.fetch = restoreFetch;
+  }
+}
+
+// Photo as its fbcdn URL, no OCR key: fail-open activation, no search.
+test("get-code screenshot as URL: fbcdn URL turn confirms activation, never searches", async () => {
+  const kv = fakeKv();
+  seedGetCodeDone(kv, { wait: true });
+  const calls = [];
+  const { envelope } = await postBotcake({ psid: PSID, text: FBCDN_PHOTO_URL }, kv, calls, { success: true, code: "90488651" });
+  assert.equal(envelope.text, "", "envelope text cleared after direct send");
+  const direct = directTextSends(calls);
+  assert.equal(direct.length, 1, "exactly one activation reply");
+  assert.match(
+    direct[0].body.message.text,
+    /تم تفعيل اشتراكك عزيزنا أحمد محمد والرقم الكودي الخاص بك هو: 90488651/u,
+    "activation reply carries the stored name and code",
+  );
+  assert.ok(!calls.some((c) => String(c.url).startsWith("https://api.ocr.space/")), "no OCR call without a key");
+  const record = kv.store.get(`user:msgr:${PSID}`);
+  assert.equal(record.parity.getcodeScreenshotAwaiting, undefined, "the wait clears after the screenshot");
+});
+
+// Photo as its fbcdn URL, OCR key set: the Worker downloads the URL and
+// OCR-verifies it (code + own name present) — real verification, not just
+// fail-open, on the Botcake path too.
+test("get-code screenshot as URL: with OCR key, downloads the URL and OCR-verifies (accept)", async () => {
+  const kv = fakeKv();
+  seedGetCodeDone(kv, { wait: true });
+  const calls = [];
+  const fetchImpl = ocrRecordingFetch(calls, {
+    macroResponse: { success: true, code: "90488651" },
+    ocrText: "Coptic\n90488651\nأحمد محمد",
+  });
+  const { envelope } = await postBotcakeWithFetch(
+    { psid: PSID, text: FBCDN_PHOTO_URL },
+    kv,
+    fetchImpl,
+    { OCR_SPACE_API_KEY: "test-ocr-key" },
+  );
+  assert.equal(envelope.text, "", "envelope text cleared after direct send");
+  assert.ok(calls.some((c) => String(c.url) === FBCDN_PHOTO_URL), "the photo URL is downloaded for OCR");
+  assert.ok(calls.some((c) => String(c.url).startsWith("https://api.ocr.space/")), "OCR runs on the downloaded bytes");
+  const direct = directTextSends(calls);
+  assert.equal(direct.length, 1, "exactly one activation reply");
+  assert.match(direct[0].body.message.text, /تم تفعيل اشتراكك عزيزنا أحمد محمد والرقم الكودي الخاص بك هو: 90488651/u);
+});
+
+// Photo as its fbcdn URL, OCR key set, screenshot without the code:
+// rejected with the single rejection text, wait stays open.
+test("get-code screenshot as URL: OCR rejects a screenshot without the code", async () => {
+  const kv = fakeKv();
+  seedGetCodeDone(kv, { wait: true });
+  const calls = [];
+  const fetchImpl = ocrRecordingFetch(calls, {
+    macroResponse: { success: true, code: "90488651" },
+    ocrText: "Coptic\nأحمد محمد",
+  });
+  const { envelope } = await postBotcakeWithFetch(
+    { psid: PSID, text: FBCDN_PHOTO_URL },
+    kv,
+    fetchImpl,
+    { OCR_SPACE_API_KEY: "test-ocr-key" },
+  );
+  assert.equal(envelope.text, "", "envelope text cleared after direct send");
+  const direct = directTextSends(calls);
+  assert.equal(direct.length, 1, "exactly one reply");
+  assert.match(
+    direct[0].body.message.text,
+    /قم برفع صورة مضبوطة تُوضح أن الرقم مسجل في جهات اتصالك، وواضح في الصورة اسمك ورقمك الكودي\./u,
+    "the single rejection text, nothing else",
+  );
+  assert.ok(!direct.some((d) => /تم تفعيل اشتراكك/u.test(d.body.message.text)), "no activation on a rejected screenshot");
+  const record = kv.store.get(`user:msgr:${PSID}`);
+  assert.equal(record.parity.getcodeScreenshotAwaiting, true, "the wait stays open so the student can re-send");
+});
+
+// Photo as its fbcdn URL with no wait: silence — the URL is never
+// searched as a dictionary word.
+test("get-code screenshot as URL with no wait: silence, no search", async () => {
+  const kv = fakeKv();
+  kv.store.set(`user:msgr:${PSID}`, { name: "Tester" });
+  const calls = [];
+  const { envelope } = await postBotcake({ psid: PSID, text: FBCDN_PHOTO_URL }, kv, calls, { success: true, code: "90488651" });
+  assert.equal(envelope.text, "", "nothing in the envelope");
+  assert.equal(directTextSends(calls).length, 0, "no direct sends at all");
+});
+
+// A plain (non-image) URL as text: silence, never searched.
+test("non-image URL text: silence, never searched", async () => {
+  const kv = fakeKv();
+  kv.store.set(`user:msgr:${PSID}`, { name: "Tester" });
+  const calls = [];
+  const { envelope } = await postBotcake({ psid: PSID, text: "https://example.com/some-page" }, kv, calls, { success: true, code: "90488651" });
+  assert.equal(envelope.text, "", "nothing in the envelope");
+  assert.equal(directTextSends(calls).length, 0, "no direct sends at all");
+});
+
+// Returning user who never activated: the greeting re-opens the wait, so
+// the screenshot sent next completes the activation.
+test("get-code returning user who never activated: greeting re-opens the wait, screenshot then activates", async () => {
+  const kv = fakeKv();
+  seedGetCodeDone(kv, { wait: false });
+  const calls = [];
+  const { envelope } = await postBotcake({ psid: PSID, text: "/getcode" }, kv, calls, { success: true, code: "90488651" });
+  assert.equal(envelope.text, "", "envelope text cleared after direct send");
+  const direct = directTextSends(calls);
+  assert.match(direct.map((d) => d.body.message.text).join("\n"), /مرحباً أحمد محمد، الرقم الكودي الخاص بك هو 90488651/u, "greeting carries the stored name and code");
+  const record = kv.store.get(`user:msgr:${PSID}`);
+  assert.equal(record.parity.getcodeScreenshotAwaiting, true, "the greeting re-opens the wait for a never-activated user");
+  const calls2 = [];
+  await postBotcake({ psid: PSID, text: FBCDN_PHOTO_URL }, kv, calls2, { success: true, code: "90488651" });
+  const direct2 = directTextSends(calls2);
+  assert.equal(direct2.length, 1, "exactly one activation reply");
+  assert.match(direct2[0].body.message.text, /تم تفعيل اشتراكك عزيزنا أحمد محمد والرقم الكودي الخاص بك هو: 90488651/u);
+});
+
+// Returning user who already activated: the greeting does NOT re-open
+// the wait — a stray photo/like later cannot re-trigger the activation.
+test("get-code returning user who already activated: greeting does not re-open the wait", async () => {
+  const kv = fakeKv();
+  seedGetCodeDone(kv, { wait: false });
+  kv.store.set(`user:msgr:${PSID}`, {
+    name: "Tester",
+    parity: {
+      getcodeScreenshotName: "أحمد محمد",
+      getcodeScreenshotCode: "90488651",
+      getcodeActivated: true,
+    },
+  });
+  const calls = [];
+  await postBotcake({ psid: PSID, text: "/getcode" }, kv, calls, { success: true, code: "90488651" });
+  const record = kv.store.get(`user:msgr:${PSID}`);
+  assert.equal(record.parity.getcodeScreenshotAwaiting, undefined, "no wait re-opened for an activated user");
+});
+
+// /resetcode clears the activation flag too, so the next /getcode runs
+// the full flow again.
+test("get-code /resetcode clears the activation flag", async () => {
+  const kv = fakeKv();
+  kv.store.set(`user:msgr:${PSID}`, {
+    name: "Tester",
+    parity: {
+      getcodeScreenshotAwaiting: true,
+      getcodeScreenshotName: "أحمد محمد",
+      getcodeScreenshotCode: "90488651",
+      getcodeActivated: true,
+    },
+  });
+  const calls = [];
+  const { envelope } = await postBotcake(
+    { psid: PSID, text: "/resetcode" },
+    kv,
+    calls,
+    { success: true, code: "90488651" },
+    { MESSENGER_ADMIN_PSID: PSID },
+  );
+  assert.equal(envelope.text, "", "envelope text cleared after direct send");
+  const direct = directTextSends(calls);
+  assert.match(direct.map((d) => d.body.message.text).join("\n"), /تم مسح الرقم الكودي المسجّل/u, "reset confirmation sent");
+  const record = kv.store.get(`user:msgr:${PSID}`);
+  assert.equal(record.parity.getcodeScreenshotName, undefined, "the name record is cleared");
+  assert.equal(record.parity.getcodeScreenshotCode, undefined, "the code record is cleared");
+  assert.equal(record.parity.getcodeScreenshotAwaiting, undefined, "the wait is cleared");
+  assert.equal(record.parity.getcodeActivated, undefined, "the activation flag is cleared");
 });

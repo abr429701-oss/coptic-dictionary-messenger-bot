@@ -350,6 +350,27 @@ export function normalizeBotcakeCommandText(text) {
 // Botcake's, so accept every plausible name — Phase 0 confirms which ones
 // the block actually sends. Query params are a fallback when the body is
 // empty or not JSON.
+// Botcake sends a photo as its Facebook CDN URL as the message text
+// (live 28 Nov 2026: the admin's get-code screenshot arrived as an
+// scontent URL, the image hook never fired, and the URL was searched as
+// a dictionary word instead of completing the activation). A bare URL
+// that is a Facebook image CDN link (fbcdn.net / cdninstagram.com) or
+// ends in an image extension is the flow's representation of the photo
+// the user just sent — not a dictionary word. Any other bare URL (a
+// pasted link to a page) is not an image turn.
+export function isBotcakeImageUrlText(text) {
+  const raw = String(text ?? "").trim();
+  if (!/^https?:\/\/\S+$/u.test(raw)) return false;
+  let host = "";
+  try {
+    host = new URL(raw).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  if (/(^|\.)fbcdn\.net$/u.test(host) || /(^|\.)cdninstagram\.com$/u.test(host)) return true;
+  return /\.(?:jpe?g|png|webp|gif)(?:[?#]|$)/iu.test(raw);
+}
+
 export function parseBotcakeInput(body, url) {
   const b = body && typeof body === "object" ? body : {};
   const q = url?.searchParams;
@@ -1300,9 +1321,11 @@ export default {
           // the text, but the image also answers the get-code screenshot
           // wait — check it first, passing the attachment so the OCR
           // verification can download it; handleImage returns null when
-          // no wait is open and the turn flows on normally.
-          if (senderId != null && Array.isArray(attachments) && attachments.some((a) => a?.type === "image")) {
-            const imgPlan = await messengerParity.handleImage(senderId, attachments.find((a) => a?.type === "image"));
+          // no wait is open and the turn flows on normally. A sticker
+          // (incl. the 👍 like) is an "image" attachment with a
+          // sticker_id — it is NOT a photo and never reaches handleImage.
+          if (senderId != null && Array.isArray(attachments) && attachments.some((a) => a?.type === "image" && !a?.payload?.sticker_id)) {
+            const imgPlan = await messengerParity.handleImage(senderId, attachments.find((a) => a?.type === "image" && !a?.payload?.sticker_id));
             if (imgPlan) return imgPlan;
           }
           // Deep link (Telegram parity): a tapped share link opens the
@@ -1360,6 +1383,11 @@ export default {
           }
           const parity = await messengerParity.handleText(senderId, query);
           if (parity) return parity;
+          // A bare URL is not a dictionary word (a photo arriving via
+          // Botcake as its URL is routed to the image path by the
+          // /botcake handler; a pasted link here gets silence, never a
+          // search for the URL).
+          if (/^https?:\/\/\S+$/u.test(String(query ?? "").trim())) return null;
           // Dictionary search fall-through: record it so /recent, /fav
           // and /mystats have real data (recordMessengerSearch skips
           // commands and never breaks the reply).
@@ -1481,18 +1509,29 @@ export default {
           (payloadAsText.startsWith("/") || payloadAsText !== input.payload);
         // A non-text message (photo/sticker/like) reaches the flow with
         // no text and no payload — Botcake forwards it as an empty-text
-        // call (UNVERIFIED live: if the flow never calls the API for
-        // images at all, the screenshot activation below cannot fire
-        // live until the flow gains an attachment trigger). The only
-        // turn that owns a bare image is the get-code screenshot wait —
-        // handleImage answers it, or null, and the turn flows on as
-        // today (empty text = silence). Safe by construction: the wait
-        // is only open right after a successful get-code.
-        if (!text && !input.payload && typeof planFor.image === "function") {
-          plan = await planFor.image(null, input.psid);
+        // call. LIVE 28 Nov 2026 (admin report): a photo ALSO arrives
+        // as its Facebook CDN URL as the text — the flow's message
+        // variable resolves a media message to the attachment URL, so
+        // the turn carried a non-empty text, the image hook below never
+        // fired, and the URL was searched as a dictionary word instead
+        // of completing the get-code activation. So an image-URL text
+        // is an image turn too: it goes to planFor.image with the URL
+        // as the attachment (the OCR verification downloads it, exactly
+        // like the webhook path; a failed download fails open). An
+        // image-like turn with no owner stays silent — an empty query
+        // or a URL is never searched as a dictionary word.
+        const imageUrlTurn = Boolean(text) && !input.payload && isBotcakeImageUrlText(text);
+        if ((!text && !input.payload) || imageUrlTurn) {
+          if (typeof planFor.image === "function") {
+            plan = await planFor.image(imageUrlTurn ? { payload: { url: text } } : null, input.psid);
+          }
         }
         if (!plan) {
-          if (payloadIsCommand) plan = await planFor.text(payloadAsText, input.psid, null);
+          if ((!text && !input.payload) || imageUrlTurn) {
+            // A photo/sticker/like (or its URL representation) with no
+            // owner: silence — never search an empty query or a URL.
+            plan = { texts: [], voiceUrl: null };
+          } else if (payloadIsCommand) plan = await planFor.text(payloadAsText, input.psid, null);
           else if (input.payload) plan = await planFor.pick(input.payload, input.psid);
           else plan = await planFor.text(text, input.psid, null);
         }
@@ -1875,6 +1914,11 @@ export default {
       console.log("botcake", JSON.stringify({
         psid: input.psid,
         ms: Date.now() - started,
+        // Input shape only (never the content): tells a later diagnosis
+        // whether a photo turn arrived empty, as its image URL, or as
+        // text — the 28 Nov 2026 screenshot bug was a URL-as-text turn.
+        textLen: String(input.text ?? "").length,
+        textIsUrl: isBotcakeImageUrlText(input.text ?? ""),
         hasText: Boolean(envelope.text),
         hasVoice: Boolean(envelope.voice_url),
         hasImage: Boolean(envelope.image_url),

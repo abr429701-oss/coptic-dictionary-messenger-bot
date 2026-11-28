@@ -1463,3 +1463,36 @@ test("messenger non-audio attachment with no text stays silent", async () => {
   };
   assert.equal(await handleMessengerMessaging(env, event, planFor, fetchImpl), false);
 });
+
+test("get-code screenshot via webhook: a sticker (like) during the wait never confirms activation", async () => {
+  // A sticker — incl. the 👍 like — arrives as an "image" attachment
+  // with a sticker_id. It is NOT a photo: it must stay silent and the
+  // wait must stay open for the real screenshot.
+  const kv = registeredKv();
+  kv.store.set(`user:msgr:${SENDER_ID}`, {
+    name: "اختبار المستخدم",
+    registeredAt: "2026-11-23T00:00:00.000Z",
+    parity: {
+      getcodeScreenshotAwaiting: true,
+      getcodeScreenshotName: "لمياء وائل شرف",
+      getcodeScreenshotCode: "13312860",
+    },
+  });
+  const kvEnv = { ...env, USERS: kv };
+  const calls = [];
+  const restore = stubMessengerApi(calls);
+  try {
+    const message = {
+      attachments: [{ type: "image", payload: { url: "https://scontent.xx.fbcdn.net/sticker.png", sticker_id: 369239263222822 } }],
+    };
+    const response = await postSigned(messageEvent(message), kvEnv);
+    assert.equal(response.status, 200);
+  } finally {
+    restore();
+  }
+  const texts = textMessages(calls);
+  assert.ok(!texts.some((t) => /تم تفعيل اشتراكك/u.test(t)), "a sticker never confirms the activation");
+  assert.equal(texts.length, 0, "a sticker during the wait gets no reply at all");
+  const record = kv.store.get(`user:msgr:${SENDER_ID}`);
+  assert.equal(record.parity.getcodeScreenshotAwaiting, true, "the wait stays open for the real screenshot");
+});

@@ -1474,7 +1474,17 @@ export function createMessengerParity(deps = {}) {
     // already have a code stored — show it directly, never re-ask for
     // name/phone. The stored name+code persist after the screenshot wait
     // clears (only the wait flag is ever cleared, never the record).
+    // 28 Nov 2026 (screenshot bug): a returning user who never
+    // activated yet (no getcodeActivated — their first session ended
+    // before the screenshot, e.g. a menu tap cleared the wait) gets
+    // the wait re-opened by the greeting, so the screenshot they send
+    // next completes the activation instead of being searched as a
+    // word. Already-activated users get the greeting only — no wait,
+    // so a stray photo/like later cannot re-trigger the activation.
     if (state?.getcodeScreenshotName && state?.getcodeScreenshotCode) {
+      if (!state.getcodeActivated) {
+        await commit(senderId, state, { getcodeScreenshotAwaiting: true });
+      }
       return { ...textPlan(`مرحباً ${state.getcodeScreenshotName}، الرقم الكودي الخاص بك هو ${state.getcodeScreenshotCode}`), getCodeReply: true };
     }
     await commit(senderId, state, {
@@ -1573,6 +1583,13 @@ export function createMessengerParity(deps = {}) {
   // would drop it otherwise); on the webhook path the flag is ignored
   // and the text is sent directly.
   async function handleImage(senderId, image = null) {
+    // A sticker (incl. the 👍 like) is an "image" attachment with a
+    // sticker_id — it is NOT a photo and must never confirm the
+    // activation. Defense in depth: the webhook router already filters
+    // stickers out, and the Botcake empty-text path cannot tell a
+    // sticker from a photo (known hole, documented — it fails open
+    // there by design, since a photo has no other signal on that path).
+    if (image?.payload?.sticker_id) return null;
     const state = await load(senderId);
     if (state?.getcodeScreenshotAwaiting && state?.getcodeScreenshotName && state?.getcodeScreenshotCode) {
       const imageUrl = image?.payload?.url ?? null;
@@ -1580,7 +1597,7 @@ export function createMessengerParity(deps = {}) {
       if (verdict === "unsaved-number" || verdict === "no-code" || verdict === "name-mismatch") {
         return { ...textPlan(GET_CODE_SCREENSHOT_UNSAVED_TEXT), getCodeReply: true };
       }
-      await commit(senderId, state, { getcodeScreenshotAwaiting: undefined });
+      await commit(senderId, state, { getcodeScreenshotAwaiting: undefined, getcodeActivated: true });
       return { ...textPlan(`تم تفعيل اشتراكك عزيزنا ${state.getcodeScreenshotName} والرقم الكودي الخاص بك هو: ${state.getcodeScreenshotCode}`), getCodeReply: true };
     }
     return null;
@@ -3473,6 +3490,7 @@ export function createMessengerParity(deps = {}) {
             getcodeStep: undefined, getcodeName: undefined,
             getcodeScreenshotAwaiting: undefined,
             getcodeScreenshotName: undefined, getcodeScreenshotCode: undefined,
+            getcodeActivated: undefined,
           });
           return { ...textPlan("تم مسح الرقم الكودي المسجّل — ابعت /getcode من الأول."), getCodeReply: true };
         }
