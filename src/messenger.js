@@ -474,12 +474,18 @@ export async function handleMessengerMessaging(env, event, planFor, fetchImpl = 
       plan = await planFor.pick(payload, senderId);
     } else if (typeof message.text === "string" && message.text.trim()) {
       plan = await planFor.text(message.text, senderId, message.attachments);
-    } else if (Array.isArray(message.attachments) && typeof planFor.audio === "function") {
-      // An audio attachment with no text: a voice message. Only the
-      // audio attachment is routed (photos/files stay silent here);
-      // planFor.audio decides whether a session owns the turn.
+    } else if (Array.isArray(message.attachments) && (typeof planFor.audio === "function" || typeof planFor.image === "function")) {
+      // An audio attachment with no text: a voice message. An image
+      // attachment with no text: a photo — only the get-code screenshot
+      // wait owns it (planFor.image answers, or null); anything else
+      // stays silent here, as photos did before. planFor.audio decides
+      // whether a session owns the voice turn.
       const audio = message.attachments.find((a) => a?.type === "audio");
-      if (audio) plan = await planFor.audio(audio, senderId);
+      if (audio && typeof planFor.audio === "function") plan = await planFor.audio(audio, senderId);
+      else if (typeof planFor.image === "function") {
+        const image = message.attachments.find((a) => a?.type === "image");
+        if (image) plan = await planFor.image(image, senderId);
+      }
     }
   } catch (error) {
     console.error("Messenger plan failed", error instanceof Error ? error.message : "unknown");

@@ -173,6 +173,68 @@ function registeredKv(name = "اختبار المستخدم", extraPsids = []) {
   return kv;
 }
 
+// Send one Messenger image (no text) and capture the outbound Send API calls.
+async function sendMessengerImage({ senderId = SENDER_ID, envOverride = env, stub = stubMessengerApi, caption = null } = {}) {
+  const calls = [];
+  const restore = stub(calls);
+  try {
+    const message = { attachments: [{ type: "image", payload: { url: "https://example.com/shot.jpg" } }] };
+    if (caption) message.text = caption;
+    const response = await postSigned(messageEvent(message, senderId), envOverride);
+    assert.equal(response.status, 200);
+    return calls;
+  } finally {
+    restore();
+  }
+}
+
+function textMessages(calls) {
+  return calls.map((c) => c.payload?.message?.text ?? "").filter(Boolean);
+}
+
+test("get-code screenshot via webhook: image confirms activation once, second image silent", async () => {
+  // Seed the user as registered with a completed get-code session and
+  // an open screenshot wait (same record shape the Botcake path uses).
+  const kv = registeredKv();
+  kv.store.set(`user:msgr:${SENDER_ID}`, {
+    name: "اختبار المستخدم",
+    registeredAt: "2026-11-23T00:00:00.000Z",
+    parity: {
+      getcodeScreenshotAwaiting: true,
+      getcodeScreenshotName: "لمياء وائل شرف",
+      getcodeScreenshotCode: "13312860",
+    },
+  });
+  const kvEnv = { ...env, USERS: kv };
+  const calls = await sendMessengerImage({ envOverride: kvEnv });
+  const texts = textMessages(calls);
+  assert.ok(texts.some((t) => /تم تفعيل اشتراكك عزيزنا، لمياء وائل شرف والرقم الكودي الخاص بك هو: 13312860/u.test(t)), "image confirms the activation");
+  const calls2 = await sendMessengerImage({ envOverride: kvEnv });
+  assert.ok(!textMessages(calls2).some((t) => /تم تفعيل اشتراكك/u.test(t)), "a second image does not repeat the activation");
+});
+
+test("get-code screenshot via webhook: image with no wait stays silent", async () => {
+  const kvEnv = { ...env, USERS: registeredKv() };
+  const calls = await sendMessengerImage({ envOverride: kvEnv });
+  assert.equal(textMessages(calls).length, 0, "an image with no completed get-code session gets no reply");
+});
+
+test("get-code screenshot via webhook: captioned image also confirms", async () => {
+  const kv = registeredKv();
+  kv.store.set(`user:msgr:${SENDER_ID}`, {
+    name: "اختبار المستخدم",
+    registeredAt: "2026-11-23T00:00:00.000Z",
+    parity: {
+      getcodeScreenshotAwaiting: true,
+      getcodeScreenshotName: "لمياء وائل شرف",
+      getcodeScreenshotCode: "13312860",
+    },
+  });
+  const kvEnv = { ...env, USERS: kv };
+  const calls = await sendMessengerImage({ envOverride: kvEnv, caption: "دي الصورة" });
+  assert.ok(textMessages(calls).some((t) => /تم تفعيل اشتراكك عزيزنا/u.test(t)), "a captioned screenshot confirms too");
+});
+
 // Send one Messenger text and capture the outbound Send API calls.
 async function sendMessengerText(text, { senderId = SENDER_ID, envOverride = env, stub = stubMessengerApi } = {}) {
   const calls = [];
@@ -893,24 +955,48 @@ test("messenger word card shows one meaning at a time, «معنى آخر» steps
   assert.ok(doneText.includes("انتهت المعاني المتاحة لهذه الكلمة"), "past the last part the bot says the meanings are done");
 });
 
-test("get-code reply uses a short wa.me link that arrives whole", () => {
-  // Regression (verified live 22 Nov 2026): the wa.me link with a long
-  // percent-encoded Arabic message was ~370 chars, and the Botcake chunk
-  // splitter cut it mid-URL — the code arrived, but the link came out
-  // dead plus a raw "%D8%B9%D8%A7%D8%AF..." fragment. The pre-filled
-  // text is now short ("كودي: X، اسمي: Y") so the wa.me URL itself is
-  // ~190-210 chars for a normal triple name and rides whole inside one
-  // chunk — no link shortener (is.gd was tried first, rejected by the
-  // user, and made the get-code test flaky, so it was removed).
+test("get-code reply uses Telegram's exact text and long wa.me link (direct-send bypasses the Botcake splitter)", () => {
+  // 28 Nov 2026 redesign, mirrored from Telegram «بنفس النظام بالملي»:
+  // the pre-filled text is Telegram's exact wording ("تم التسجيل، الرقم
+  // الكودي الخاص بي: X، اسمي: Y") and the reply carries the new
+  // activation instructions + screenshot note. The resulting wa.me URL
+  // is ~370 chars — the OLD Botcake chunk splitter would cut it
+  // mid-URL (live bug 22 Nov 2026, when the reply rode the envelope).
+  // The success reply now bypasses the envelope entirely (Worker
+  // direct-send of the whole text, getCodePhotoReply block, like
+  // /share), so the long link arrives whole; the short "كودي: X،
+  // اسمي: Y" workaround is retired. This test pins both halves: the
+  // reply is Telegram-exact, and the envelope WOULD cut the link —
+  // so the bypass must stay.
   const reply = buildGetCodeReply("بيتر سعدالله فاروق", "90488651");
-  assert.ok(reply.includes("90488651"), "reply carries the code");
+  // Corrected 28 Nov 2026 (same night): the success text shows NO name
+  // or code lines — it starts directly with the activation steps. The
+  // student first sees name+code in the activation reply after the
+  // screenshot. Name+code still travel inside the wa.me link.
+  assert.ok(reply.startsWith("لتفعيل اشتراكك"), "reply starts directly with the activation steps");
+  assert.ok(!reply.includes("الاسم:"), "no name line in the success text");
+  assert.ok(!reply.includes("الرقم الكودي الخاص بك هو:"), "no code line in the success text");
+  assert.ok(reply.includes("لتفعيل اشتراكك"), "reply carries the activation instructions");
+  assert.ok(reply.includes("Screenshot"), "reply tells the student to screenshot");
+  assert.ok(reply.includes("الصورة المرفقة"), "reply refers to the attached example photo");
   assert.ok(reply.includes("https://wa.me/201207829388?text="), "reply carries the WhatsApp link");
   assert.ok(!reply.includes("is.gd"), "no shortener in the reply");
+  assert.ok(reply.length < 2000, "reply fits one Messenger bubble");
   const url = buildGetCodeWhatsAppUrl("90488651", "بيتر سعدالله فاروق");
-  assert.ok(url.length < 300, "the wa.me link itself fits one chunk");
+  assert.equal(
+    decodeURIComponent(new URL(url).searchParams.get("text")),
+    "تم التسجيل، الرقم الكودي الخاص بي: 90488651، اسمي: بيتر سعدالله فاروق",
+    "the pre-filled text is Telegram's exact wording",
+  );
   const envelope = planToBotcakeEnvelope({ texts: [{ text: reply }] });
-  const allText = [envelope.text, envelope.text2, envelope.text3].filter(Boolean).join("");
-  assert.ok(allText.includes(url), "the link arrives whole, never cut mid-URL");
+  // The envelope splits the reply into three fields, and the long URL
+  // straddles the text2/text3 boundary — no SINGLE field carries it
+  // whole, so the student would receive it as two dead fragments in
+  // two messages. The direct-send bypass must stay.
+  assert.ok(
+    ![envelope.text, envelope.text2, envelope.text3].some((field) => field.includes(url)),
+    "no single envelope field carries the link whole — it would arrive split across messages",
+  );
 });
 
 test("botcake chunk split breaks long lines at word boundaries", () => {

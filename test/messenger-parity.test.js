@@ -46,6 +46,7 @@ import {
   R2_MEDIA_BASE_URL,
 } from "../src/messenger-parity.js";
 import { LEARN_LEVELS } from "../src/learn-manifest.js";
+import { GET_CODE_EXAMPLE_PHOTO_URL } from "../src/getcode.js";
 import { createDispatchCommands, PARKED_DISPATCH_MESSAGES } from "../src/dispatch-commands.js";
 
 const ADMIN_PSID = "123456789012345";
@@ -473,10 +474,15 @@ test("get-code formula: code = parseInt(last 8 digits) + 1234567, Arabic-Indic d
   const shortPhone = await parity.handleText(USER_PSID, "123");
   assert.match(shortPhone.texts[0].text, /٤ أرقام على الأقل/u);
   const done = await parity.handleText(USER_PSID, "١٢٠٧٨٢٩٣");
-  // Phone 12078293 (8 digits): 12078293 + 1234567 = 13312860.
-  assert.match(done.texts[0].text, /الرقم الكودي الخاص بك هو: 13312860/u);
+  // Phone 12078293 (8 digits): 12078293 + 1234567 = 13312860. The
+  // success text shows NO name/code lines (corrected 28 Nov 2026) —
+  // the code travels inside the wa.me link; the student first sees it
+  // in the activation reply after the screenshot.
+  assert.ok(done.texts[0].text.startsWith("لتفعيل اشتراكك"), "reply starts with the activation steps");
+  assert.doesNotMatch(done.texts[0].text, /الاسم:/u, "no name line in the success text");
+  assert.doesNotMatch(done.texts[0].text, /الرقم الكودي الخاص بك هو:/u, "no code line in the success text");
   assert.match(done.texts[0].text, /wa\.me\/201207829388/u, "reply carries the admin WhatsApp link");
-  assert.match(done.texts[0].text, /لمياء وائل شرف/u);
+  assert.match(done.texts[0].text, /13312860/u, "the code is inside the WhatsApp link");
 });
 
 test("get-code macro failure falls back to the registration instructions, never inventing a code", async () => {
@@ -487,6 +493,60 @@ test("get-code macro failure falls back to the registration instructions, never 
   assert.match(failed.texts[0].text, /تعذّر إحضار الرقم الكودي/u);
   assert.match(failed.texts[0].text, /201207829388/u, "fallback tells the student to contact the admin");
   assert.doesNotMatch(failed.texts[0].text, /13312860/u);
+});
+
+// 28 Nov 2026 redesign (Telegram's exact behavior): the success plan
+// carries the reply text + the example screenshot image (text first,
+// then the image — Messenger has no photo captions), flagged for the
+// Worker's direct send so the long wa.me link never hits the Botcake
+// chunk splitter.
+test("get-code success plan: text + example image, flagged for direct send", async () => {
+  const parity = makeParity();
+  await parity.handleText(USER_PSID, "/getcode");
+  await parity.handleText(USER_PSID, "لمياء وائل شرف");
+  const done = await parity.handleText(USER_PSID, "١٢٠٧٨٢٩٣");
+  assert.equal(done.getCodePhotoReply, true, "success rides the direct-send block, not the envelope");
+  assert.equal(done.attachments?.length, 1, "one attachment: the example screenshot");
+  assert.equal(done.attachments[0].type, "image");
+  assert.equal(done.attachments[0].url, GET_CODE_EXAMPLE_PHOTO_URL);
+  assert.match(done.texts[0].text, /لتفعيل اشتراكك/u, "reply carries the activation instructions");
+  assert.match(done.texts[0].text, /Screenshot/u, "reply tells the student to screenshot");
+  assert.match(done.texts[0].text, /الصورة المرفقة/u, "reply refers to the attached example photo");
+});
+
+// Screenshot wait: the image confirms the activation once, clears only
+// the wait, and the stored record survives for returning users.
+test("get-code screenshot: activation once, wait clears, record persists for returning users", async () => {
+  const parity = makeParity();
+  await parity.handleText(USER_PSID, "/getcode");
+  await parity.handleText(USER_PSID, "لمياء وائل شرف");
+  await parity.handleText(USER_PSID, "١٢٠٧٨٢٩٣");
+  const shot = await parity.handleImage(USER_PSID);
+  assert.match(shot.texts[0].text, /تم تفعيل اشتراكك عزيزنا، لمياء وائل شرف والرقم الكودي الخاص بك هو: 13312860/u);
+  assert.equal(await parity.handleImage(USER_PSID), null, "a second image does not repeat the activation");
+  // The record survived the screenshot reply: tapping get-code again
+  // greets the user with the stored code, no re-asking.
+  const again = await parity.handleText(USER_PSID, "/getcode");
+  assert.match(again.texts[0].text, /مرحباً، لمياء وائل شرف، الرقم الكودي الخاص بك هو 13312860/u);
+  assert.doesNotMatch(again.texts[0].text, /اسمك الثلاثي/u);
+});
+
+test("get-code screenshot with no completed session: silence", async () => {
+  const parity = makeParity();
+  assert.equal(await parity.handleImage(USER_PSID), null, "an image with no wait gets no activation reply");
+});
+
+// /cancel while the screenshot wait is open clears only the wait — the
+// stored name+code still greet the user on the next get-code tap.
+test("get-code /cancel clears the screenshot wait but keeps the record", async () => {
+  const parity = makeParity();
+  await parity.handleText(USER_PSID, "/getcode");
+  await parity.handleText(USER_PSID, "لمياء وائل شرف");
+  await parity.handleText(USER_PSID, "١٢٠٧٨٢٩٣");
+  await parity.handleText(USER_PSID, "/cancel");
+  assert.equal(await parity.handleImage(USER_PSID), null, "the wait is gone after /cancel");
+  const again = await parity.handleText(USER_PSID, "/getcode");
+  assert.match(again.texts[0].text, /مرحباً، لمياء وائل شرف، الرقم الكودي الخاص بك هو 13312860/u, "the record survives /cancel");
 });
 
 // ---------------------------------------------------------------------------

@@ -532,8 +532,8 @@ export default {
         if (record?.name) return null;
         const parity = record?.parity ?? {};
         const next = { ...(record ?? {}), awaitingName: true };
-        if (parity.certAwaiting || parity.getcodeStep || parity.getcodeName || parity.examAwaiting || parity.recordState || parity.recordPick) {
-          next.parity = { ...parity, certAwaiting: undefined, getcodeStep: undefined, getcodeName: undefined, examAwaiting: undefined, recordState: undefined, recordPick: undefined };
+        if (parity.certAwaiting || parity.getcodeStep || parity.getcodeName || parity.getcodeScreenshotAwaiting || parity.examAwaiting || parity.recordState || parity.recordPick) {
+          next.parity = { ...parity, certAwaiting: undefined, getcodeStep: undefined, getcodeName: undefined, getcodeScreenshotAwaiting: undefined, examAwaiting: undefined, recordState: undefined, recordPick: undefined };
         }
         await saveUser(env, `msgr:${senderId}`, next);
         return { texts: [{ text: FIRST_TIME_TEXT }], voiceUrl: null };
@@ -568,7 +568,11 @@ export default {
           return { texts: [{ text: "✅ تم إلغاء إدخال الرقم الكودي." }], voiceUrl: null };
         }
         if (parity.getcodeStep) {
-          await saveUser(env, `msgr:${senderId}`, { ...record, parity: { ...parity, getcodeStep: undefined, getcodeName: undefined } });
+          await saveUser(env, `msgr:${senderId}`, { ...record, parity: { ...parity, getcodeStep: undefined, getcodeName: undefined, getcodeScreenshotAwaiting: undefined } });
+          return { texts: [{ text: "✅ تم إلغاء الحصول على الرقم الكودي." }], voiceUrl: null };
+        }
+        if (parity.getcodeScreenshotAwaiting) {
+          await saveUser(env, `msgr:${senderId}`, { ...record, parity: { ...parity, getcodeScreenshotAwaiting: undefined } });
           return { texts: [{ text: "✅ تم إلغاء الحصول على الرقم الكودي." }], voiceUrl: null };
         }
         if (parity.recordState || parity.recordPick) {
@@ -1288,6 +1292,14 @@ export default {
             const hasMedia = Array.isArray(attachments) && attachments.some((a) => a?.type && a.type !== "audio");
             await liveMonitorHook(senderId, hasMedia ? "media" : "text", query);
           }
+          // A captioned image (photo with a caption): the caption is
+          // the text, but the image also answers the get-code screenshot
+          // wait — check it first; handleImage returns null when no
+          // wait is open and the turn flows on normally.
+          if (senderId != null && Array.isArray(attachments) && attachments.some((a) => a?.type === "image")) {
+            const imgPlan = await messengerParity.handleImage(senderId);
+            if (imgPlan) return imgPlan;
+          }
           // Deep link (Telegram parity): a tapped share link opens the
           // word directly — before the name gate, so a first-time user
           // who taps a shared link gets the word (Telegram's /start
@@ -1378,6 +1390,14 @@ export default {
           await liveMonitorHook(senderId, "voice", "");
           return messengerParity.handleAudio(senderId, attachment);
         },
+        // An image message (photo attachment, no text): only the
+        // get-code screenshot wait owns it — handleImage answers the
+        // activation, or null (silence) when no wait is open. The live
+        // monitor logs it as media before the wait decides.
+        image: async (attachment, senderId) => {
+          await liveMonitorHook(senderId, "media", "");
+          return messengerParity.handleImage(senderId);
+        },
         executeTask: (task, senderId, fetchImpl) => executeMessengerTask(env, task, senderId, fetchImpl, { ctx }),
       };
       planForCache = planFor;
@@ -1452,9 +1472,23 @@ export default {
         const payloadIsCommand =
           Boolean(input.payload) &&
           (payloadAsText.startsWith("/") || payloadAsText !== input.payload);
-        if (payloadIsCommand) plan = await planFor.text(payloadAsText, input.psid, null);
-        else if (input.payload) plan = await planFor.pick(input.payload, input.psid);
-        else plan = await planFor.text(text, input.psid, null);
+        // A non-text message (photo/sticker/like) reaches the flow with
+        // no text and no payload — Botcake forwards it as an empty-text
+        // call (UNVERIFIED live: if the flow never calls the API for
+        // images at all, the screenshot activation below cannot fire
+        // live until the flow gains an attachment trigger). The only
+        // turn that owns a bare image is the get-code screenshot wait —
+        // handleImage answers it, or null, and the turn flows on as
+        // today (empty text = silence). Safe by construction: the wait
+        // is only open right after a successful get-code.
+        if (!text && !input.payload && typeof planFor.image === "function") {
+          plan = await planFor.image(null, input.psid);
+        }
+        if (!plan) {
+          if (payloadIsCommand) plan = await planFor.text(payloadAsText, input.psid, null);
+          else if (input.payload) plan = await planFor.pick(input.payload, input.psid);
+          else plan = await planFor.text(text, input.psid, null);
+        }
       } catch (error) {
         console.error("Botcake plan failed", error instanceof Error ? error.message : "unknown");
         try {
@@ -1493,7 +1527,7 @@ export default {
       // exist (saved by this run) and Botcake sends as normal, so this
       // direct send only ever fires once per user. Awaited (like the
       // video/cert sends) so it lands before the envelope returns.
-      if (isFirstEver && envelope.text && !plan?.shareReply) {
+      if (isFirstEver && envelope.text && !plan?.shareReply && !plan?.getCodePhotoReply) {
         try {
           let quickReplies = [];
           try {
@@ -1596,6 +1630,75 @@ export default {
           if (sentCount === chunks.length) envelope.quick_replies = "";
         } catch (error) {
           console.error("Botcake direct text send failed", error instanceof Error ? error.message : "unknown");
+        }
+      }
+      // Get-code success (28 Nov 2026 redesign, Telegram's exact text):
+      // the full reply text FIRST, then the example screenshot image
+      // (Messenger has no photo captions — same words, same order).
+      // The text goes out WHOLE as one message (Meta cap 2000 chars;
+      // the reply is ~700), so the long wa.me link never hits the
+      // Botcake chunk splitter — the 22 Nov 2026 bug, when the reply
+      // rode the envelope and the splitter cut the URL mid-link. Same
+      // direct-send pattern as /share below. On success the envelope
+      // is cleared so the flow sends nothing (no double); a failed
+      // text send leaves the text fields so the flow tries them (split,
+      // degraded), and a failed image send leaves image_url as a flow
+      // fallback. The five fixed nav buttons ride on the LAST message
+      // (the image — Meta allows quick replies on attachment messages),
+      // like the other direct sends.
+      if (plan?.getCodePhotoReply && envelope.text && !isFirstEver) {
+        try {
+          let quickReplies = [];
+          try {
+            const parsed = envelope.quick_replies ? JSON.parse(envelope.quick_replies) : [];
+            if (Array.isArray(parsed)) quickReplies = parsed;
+          } catch {
+            /* no quick replies in the envelope */
+          }
+          if (!quickReplies.length) {
+            quickReplies = ["البداية", "تعلّم", "القائمة", "كلمة عشوائية", "تواصل معنا"].map((title) => ({
+              title,
+              payload: title,
+            }));
+          }
+          const quickRepliesPayload = quickReplies.map((q) => ({
+            content_type: "text",
+            title: String(q.title ?? "").slice(0, 20),
+            payload: String(q.payload ?? ""),
+          }));
+          const replyText = (Array.isArray(plan?.texts) ? plan.texts : []).map((t) => t?.text).filter(Boolean).join("\n\n");
+          let textSent = false;
+          if (replyText) {
+            const sent = await sendMessengerMessage(env, input.psid, { text: replyText }, globalThis.fetch);
+            textSent = Boolean(sent?.ok);
+            if (!textSent) console.error("Botcake get-code text send failed", sent?.error ?? "unknown");
+          }
+          const imgUrl = Array.isArray(plan?.attachments)
+            ? (plan.attachments.find((a) => a?.type === "image" && a?.url)?.url ?? "")
+            : "";
+          let imgSent = false;
+          if (imgUrl) {
+            const imgMsg = { ...messengerAttachmentMessage("image", imgUrl) };
+            if (quickRepliesPayload.length) imgMsg.quick_replies = quickRepliesPayload;
+            const imgRes = await sendMessengerMessage(env, input.psid, imgMsg, globalThis.fetch);
+            imgSent = Boolean(imgRes?.ok);
+            if (!imgSent) console.error("Botcake get-code image send failed", imgRes?.error ?? "unknown");
+          }
+          if (textSent) {
+            envelope.text = "";
+            envelope.text2 = "";
+            envelope.text3 = "";
+            envelope.has_text = "no";
+            envelope.has_text2 = "no";
+            envelope.has_text3 = "no";
+          }
+          if (imgSent) {
+            envelope.image_url = "";
+            envelope.has_image = "no";
+          }
+          if (textSent && imgSent) envelope.quick_replies = "";
+        } catch (error) {
+          console.error("Botcake get-code photo send failed", error instanceof Error ? error.message : "unknown");
         }
       }
       // /share (25 Nov 2026): the v2 launch announcement + poster. The

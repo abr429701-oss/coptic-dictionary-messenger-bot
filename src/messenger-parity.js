@@ -73,6 +73,7 @@ import {
   getCodeFromMacro,
   buildGetCodeReply,
   getCodePhoneValid,
+  GET_CODE_EXAMPLE_PHOTO_URL,
 } from "./getcode.js";
 import { copticNameReply } from "./coptic-name.js";
 import { buildQuickReplies, plainTextCard } from "./messenger.js";
@@ -1112,6 +1113,11 @@ export function createMessengerParity(deps = {}) {
   // saveState persists the whole slice. State shape:
   //   { certAwaiting: "0"|"1", getcodeStep: "name"|"phone",
   //     getcodeName, examAwaiting: { formId, examUrl, lessonId },
+  //     getcodeScreenshotAwaiting: true (waiting for the WhatsApp
+  //       screenshot after a successful get-code), getcodeScreenshotName
+  //       + getcodeScreenshotCode (the completed session — persist
+  //       after the wait clears, so returning users get their code back
+  //       without re-asking; only the wait flag is ever cleared),
   //     lastLessonId, lastLevelId, pendingBroadcast,
   //     scheduleFlow: { stage: "await-message"|"await-time", draft },
   //     recordState: { mode: "sequential"|"chosen", id, coptic },
@@ -1165,6 +1171,7 @@ export function createMessengerParity(deps = {}) {
 
   const clearFlows = {
     certAwaiting: undefined, getcodeStep: undefined, getcodeName: undefined,
+    getcodeScreenshotAwaiting: undefined,
     examAwaiting: undefined, copticNameAwaiting: undefined,
     pendingBroadcast: undefined, pendingConfirm: undefined, menuList: undefined,
     recordState: undefined, recordPick: undefined, scheduleFlow: undefined,
@@ -1417,6 +1424,7 @@ export function createMessengerParity(deps = {}) {
       lastLevelId: level.id,
       examAwaiting: exam ? { formId: exam.formId, examUrl: exam.examUrl, lessonId } : undefined,
       certAwaiting: undefined, getcodeStep: undefined, getcodeName: undefined,
+      getcodeScreenshotAwaiting: undefined,
       pendingBroadcast: undefined, recordState: undefined, recordPick: undefined,
       menuList: { kind: "learn-nav", lessonId },
     });
@@ -1454,6 +1462,13 @@ export function createMessengerParity(deps = {}) {
   // -- get-code --------------------------------------------------------------
 
   async function beginGetCodeFlow(senderId, state) {
+    // Returning user (28 Nov 2026, Telegram's exact behavior): they
+    // already have a code stored — show it directly, never re-ask for
+    // name/phone. The stored name+code persist after the screenshot wait
+    // clears (only the wait flag is ever cleared, never the record).
+    if (state?.getcodeScreenshotName && state?.getcodeScreenshotCode) {
+      return { ...textPlan(`مرحباً، ${state.getcodeScreenshotName}، الرقم الكودي الخاص بك هو ${state.getcodeScreenshotCode}`), getCodeReply: true };
+    }
     await commit(senderId, state, {
       ...clearFlows, getcodeStep: "name", getcodeName: undefined,
     });
@@ -1491,7 +1506,7 @@ export function createMessengerParity(deps = {}) {
       return textPlan("📱 رقم الموبايل لازم يكون ٤ أرقام على الأقل — اكتبه تاني:");
     }
     const name = String(state.getcodeName ?? "").trim();
-    await commit(senderId, state, { getcodeStep: undefined, getcodeName: undefined });
+    await commit(senderId, state, { getcodeStep: undefined, getcodeName: undefined, getcodeScreenshotAwaiting: undefined });
     let result;
     try {
       result = await getCode(name, phone, macroUrl);
@@ -1499,10 +1514,26 @@ export function createMessengerParity(deps = {}) {
       result = { code: null, error: "macro-unreachable" };
     }
     if (result?.code) {
-      // Get-code reply: the /botcake handler sends this directly (see
-      // the word-card block there) — the flow drops it otherwise (live
-      // bug 24 Nov 2026: the code never arrived after name + phone).
-      return { ...textPlan(buildGetCodeReply(name, String(result.code))), getCodeReply: true };
+      // Remember the session: the name+code persist (returning users get
+      // their code back without re-asking), and the one-shot screenshot
+      // wait opens — it ends when the photo arrives, or on /cancel,
+      // /menu, /start or another menu tap (same clearing as the other
+      // waits; only the wait flag clears, never the record).
+      // Get-code reply: text FIRST, then the example screenshot image
+      // (Messenger has no photo captions — same words, same order as
+      // Telegram's captioned photo). The Worker direct-sends both whole
+      // (getCodePhotoReply block in src/index.js, like /share) so the
+      // long wa.me link never hits the Botcake chunk splitter.
+      await commit(senderId, state, {
+        getcodeStep: undefined, getcodeName: undefined,
+        getcodeScreenshotAwaiting: true, getcodeScreenshotName: name, getcodeScreenshotCode: String(result.code),
+      });
+      return {
+        texts: [{ text: buildGetCodeReply(name, String(result.code)) }],
+        voiceUrl: null,
+        attachments: [{ type: "image", url: GET_CODE_EXAMPLE_PHOTO_URL }],
+        getCodePhotoReply: true,
+      };
     }
     // The macro did not return a usable code (no URL linked, or the
     // deployment answers HTML): fall back to the registration
@@ -1510,6 +1541,26 @@ export function createMessengerParity(deps = {}) {
     // The fallback is the same shape, so it rides the direct send too —
     // otherwise the student gets silence instead of the instructions.
     return { ...textPlan(`⚠️ تعذّر إحضار الرقم الكودي مباشرة من البوت حاليًا.\n\n${LEARN_GET_CODE_TEXT}`), getCodeReply: true };
+  }
+
+  // Get-code screenshot (28 Nov 2026, Telegram's exact behavior): after
+  // the code reply, the student sends the WhatsApp screenshot back —
+  // confirm the activation with their name + code from the
+  // just-completed session. One shot: only the wait flag clears on
+  // receipt (the stored name+code persist for returning users), so a
+  // later unrelated image does not repeat it. An image without a
+  // completed get-code session returns null (normal handling — on the
+  // webhook path that means silence, as today). The plan carries
+  // getCodeReply so the /botcake path direct-sends it (the flow would
+  // drop it otherwise); on the webhook path the flag is ignored and
+  // the text is sent directly.
+  async function handleImage(senderId) {
+    const state = await load(senderId);
+    if (state?.getcodeScreenshotAwaiting && state?.getcodeScreenshotName && state?.getcodeScreenshotCode) {
+      await commit(senderId, state, { getcodeScreenshotAwaiting: undefined });
+      return { ...textPlan(`تم تفعيل اشتراكك عزيزنا، ${state.getcodeScreenshotName} والرقم الكودي الخاص بك هو: ${state.getcodeScreenshotCode}`), getCodeReply: true };
+    }
+    return null;
   }
 
   // -- exams -----------------------------------------------------------------
@@ -3488,7 +3539,7 @@ export function createMessengerParity(deps = {}) {
     return null;
   }
 
-  return { handleText, handlePick, handleAudio, isAdmin, logIncomingMessage, liveMonitorOn, buildLiveForward };
+  return { handleText, handlePick, handleAudio, handleImage, isAdmin, logIncomingMessage, liveMonitorOn, buildLiveForward };
 }
 
 // Bare-number resolution against a stored menuList, exported for the

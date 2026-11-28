@@ -17,6 +17,11 @@
 // (the standalone project's doPost returned a plain object, which a web
 // app cannot return — verified live 2026-11-09, and nothing was stored).
 export const GET_CODE_WHATSAPP_NUMBER = "201207829388";
+// The example screenshot the success reply refers to ("الصورة
+// المرفقة"): a WhatsApp chat with the admin showing the code message,
+// so the student sees exactly what screenshot to send back. Hosted on
+// R2 (public) — the same file Telegram uses.
+export const GET_CODE_EXAMPLE_PHOTO_URL = "https://pub-e39b5be260724e0ea1bbf6a7db089987.r2.dev/getcode-example.jpg";
 // Where Code.gs stores the codes (documentation — the Worker never
 // writes here; generateAndStoreCode in apps-script/Code.gs does).
 export const GET_CODE_SHEET_ID = "1Cts5whXGJTaXTvjlbR7Mt31rQE5hPzkQavslHhYTxgI";
@@ -39,24 +44,34 @@ export function getCodePhoneValid(phone) {
 // so the arriving message — not the saved contact — is what gets
 // verified.
 //
-// The pre-filled text is deliberately SHORT ("كودي: X، اسمي: Y") so
-// the wa.me URL itself stays ~190-210 chars for a normal triple name
-// and rides whole inside one Botcake text chunk — no link shortener.
-// (A long Arabic message made the URL ~370 chars and the chunk
-// splitter cut it mid-URL, leaving a dead link plus a garbage
-// fragment — verified live 22 Nov 2026. A shortener (is.gd) fixed the
-// split but was rejected by the user and made the get-code test
-// flaky, so it was removed the same day.)
+// The pre-filled text is Telegram's exact wording (28 Nov 2026
+// redesign, mirrored here «بنفس النظام بالملي»): "تم التسجيل، الرقم
+// الكودي الخاص بي: {code}، اسمي: {name}" — the same message the
+// example screenshot shows the student sending. The resulting wa.me
+// URL is ~370 chars for a normal triple name, which the OLD Botcake
+// chunk splitter would have cut mid-URL (live bug 22 Nov 2026, when
+// the reply rode the envelope) — but the success reply now bypasses
+// the envelope entirely (Worker direct-send of the whole text, like
+// /share), so the long link arrives whole. The short "كودي: X،
+// اسمي: Y" workaround is retired; no link shortener, ever.
 export function buildGetCodeWhatsAppUrl(code, name) {
-  const text = `كودي: ${code}، اسمي: ${name}`;
+  const text = `تم التسجيل، الرقم الكودي الخاص بي: ${code}، اسمي: ${name}`;
   return `https://wa.me/${GET_CODE_WHATSAPP_NUMBER}?text=${encodeURIComponent(text)}`;
 }
 
-// The reply, mirroring the form's success screen: name, code, and the
-// note to save the number and message the admin on WhatsApp to activate
-// the subscription.
+// The reply (Telegram's exact text, 28 Nov 2026 redesign, corrected
+// the same night): NO name or code lines — it starts directly with
+// the activation steps (save the admin number, open the WhatsApp chat
+// from the link, screenshot it, and send the screenshot back here in
+// the chat to complete the activation). The student first sees their
+// name and code in the ACTIVATION reply after the screenshot is
+// accepted. The name+code still travel inside the wa.me link's
+// pre-filled text. Messenger's Send API has no photo captions, so
+// this goes as a text message followed by the example screenshot image
+// (same words, same order) — see the getCodePhotoReply direct-send
+// block in src/index.js.
 export function buildGetCodeReply(name, code) {
-  return `الاسم: ${name}\nالرقم الكودي الخاص بك هو: ${code}\n\nسجّل الرقم ${GET_CODE_WHATSAPP_NUMBER} في جهات اتصالك، وبعدين ابعت رسالة على الواتساب بالرابط ده عشان تفعّل اشتراكك:\n${buildGetCodeWhatsAppUrl(code, name)}`;
+  return `لتفعيل اشتراكك، سجّل هذا الرقم +${GET_CODE_WHATSAPP_NUMBER} في جهات اتصالك أولاً، ثم اضغط على رابط الواتساب التالي:\n${buildGetCodeWhatsAppUrl(code, name)}\nلفتح المحادثة مع الرقم على الواتساب، ثم التقط Screenshot للشاشة على سبيل المثال مثل الشكل الموضح في الصورة المرفقة، ثم أرسلها هنا في الشات لإتمام التفعيل.`;
 }
 
 // POST {name, phone} to the bot's Apps Script web app (apps-script/Code.gs).
