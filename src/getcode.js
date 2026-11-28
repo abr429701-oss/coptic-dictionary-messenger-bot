@@ -81,7 +81,7 @@ export function buildGetCodeReply(name, code) {
 // and wrong name all send this same line, and the wait stays open so
 // the student can send a better screenshot. The earlier no-code draft
 // («⚠️ رسالة التسجيل مش ظاهرة...») is RETIRED.
-export const GET_CODE_SCREENSHOT_UNSAVED_TEXT = "قم برفع صورة مضبوطة تُوضح أن الرقم مسجل في جهات اتصالك، وواضح في الصورة اسمك ورقمك الكودي.";
+export const GET_CODE_SCREENSHOT_UNSAVED_TEXT = "قم برفع صورة مضبوطة تُوضح أن الرقم مسجل في جهات اتصالك، وتُوضح اسمك ورقمك الكودي في شات الواتساب.";
 
 // Screenshot verification (2026-11-28, Telegram parity —
 // ~/workspace/final-code-fix/src/getcode.js): OCR.space free tier —

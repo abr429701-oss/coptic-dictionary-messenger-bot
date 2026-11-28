@@ -397,7 +397,7 @@ test("get-code screenshot as URL: OCR rejects a screenshot without the code", as
   assert.equal(direct.length, 1, "exactly one reply");
   assert.match(
     direct[0].body.message.text,
-    /قم برفع صورة مضبوطة تُوضح أن الرقم مسجل في جهات اتصالك، وواضح في الصورة اسمك ورقمك الكودي\./u,
+    /قم برفع صورة مضبوطة تُوضح أن الرقم مسجل في جهات اتصالك، وتُوضح اسمك ورقمك الكودي في شات الواتساب\./u,
     "the single rejection text, nothing else",
   );
   assert.ok(!direct.some((d) => /تم تفعيل اشتراكك/u.test(d.body.message.text)), "no activation on a rejected screenshot");

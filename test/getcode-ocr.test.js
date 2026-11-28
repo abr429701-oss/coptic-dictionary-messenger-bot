@@ -17,7 +17,7 @@ import {
 test("OCR rejection text: ONE text for every screenshot rejection, the user's exact final wording", () => {
   assert.equal(
     GET_CODE_SCREENSHOT_UNSAVED_TEXT,
-    "قم برفع صورة مضبوطة تُوضح أن الرقم مسجل في جهات اتصالك، وواضح في الصورة اسمك ورقمك الكودي.",
+    "قم برفع صورة مضبوطة تُوضح أن الرقم مسجل في جهات اتصالك، وتُوضح اسمك ورقمك الكودي في شات الواتساب.",
     "no emoji, no phone number, word-for-word",
   );
 });
