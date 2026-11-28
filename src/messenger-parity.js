@@ -1551,29 +1551,33 @@ export function createMessengerParity(deps = {}) {
     // validated and held in getcodePhone until the name step calls the
     // macro with (name, phone). The macro gets the folded phone as
     // typed (Western digits), never the canonical registry form.
-    // The phone must canonicalize (Telegram's rule: the 12-digit
-    // "20..." form) — anything else is re-asked, exactly like
-    // Telegram. A registry hit greets immediately with the stored
-    // name+code (the student already got their code — and passed the
+    // Only a too-short phone (<4 digits) is re-asked. A phone that
+    // does not canonicalize to the 12-digit "20..." registry form
+    // (e.g. a short test number) still proceeds to the name step —
+    // the registry lookup is simply skipped for it (user report,
+    // 28 Nov 2026: a correct-but-short phone must not be rejected).
+    // A registry hit greets immediately with the stored name+code (the student already got their code — and passed the
     // screenshot check — on another platform); entries are written
     // only at activation time, so a hit is always an activated
     // student. Any registry error/timeout → miss path (fail open —
     // never strand a student).
     if (state.getcodeStep === "phone") {
       const phone = normalizeGetCodePhoneMsgr(text);
-      const canonical = canonicalGetCodePhone(phone);
-      if (!canonical) {
+      if (!getCodePhoneValidMsgr(phone)) {
         return textPlan("📱 رقم الموبايل لازم يكون ٤ أرقام على الأقل — اكتبه تاني:");
       }
-      const hit = await getCodeRegistryLookup(canonical, registryOpts());
-      if (hit?.found && hit.code) {
-        await commit(senderId, state, {
-          getcodeStep: undefined, getcodeName: undefined, getcodePhone: phone,
-          getcodeScreenshotAwaiting: undefined,
-          getcodeScreenshotName: hit.name, getcodeScreenshotCode: String(hit.code),
-          getcodeActivated: true,
-        });
-        return { ...textPlan(`مرحباً ${hit.name}، الرقم الكودي الخاص بك هو ${hit.code}`), getCodeReply: true };
+      const canonical = canonicalGetCodePhone(phone);
+      if (canonical) {
+        const hit = await getCodeRegistryLookup(canonical, registryOpts());
+        if (hit?.found && hit.code) {
+          await commit(senderId, state, {
+            getcodeStep: undefined, getcodeName: undefined, getcodePhone: phone,
+            getcodeScreenshotAwaiting: undefined,
+            getcodeScreenshotName: hit.name, getcodeScreenshotCode: String(hit.code),
+            getcodeActivated: true,
+          });
+          return { ...textPlan(`مرحباً ${hit.name}، الرقم الكودي الخاص بك هو ${hit.code}`), getCodeReply: true };
+        }
       }
       await commit(senderId, state, { getcodeStep: "name", getcodePhone: phone });
       return textPlan("✏️ اكتب اسمك الثلاثي:");
@@ -1581,11 +1585,12 @@ export function createMessengerParity(deps = {}) {
     const name = String(text ?? "").trim();
     if (!name) return textPlan("✏️ اكتب اسمك الثلاثي:");
     const phone = String(state.getcodePhone ?? "").trim();
-    // The phone is already known (canonical, from the phone step). If
-    // it is missing — e.g. a stale record — go back to the phone
-    // question instead of guessing (Telegram parity).
-    const canonical = canonicalGetCodePhone(phone);
-    if (!canonical) {
+    // The phone is already known (from the phone step). If it is
+    // missing or too short — e.g. a stale record — go back to the
+    // phone question instead of guessing. A phone that does not
+    // canonicalize still proceeds: the macro takes it as typed and
+    // the activation-time registry write is skipped for it.
+    if (!getCodePhoneValidMsgr(phone)) {
       await commit(senderId, state, { getcodeStep: "phone", getcodeName: undefined });
       return textPlan("📱 اكتب رقم موبايلك:");
     }

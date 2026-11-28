@@ -204,12 +204,12 @@ test("getcode registry flow: registry error fails open to the miss path", async 
   assert.match(askName.texts[0].text, /اسمك الثلاثي/u, "a registry outage never strands the student");
 });
 
-test("getcode registry flow: a non-canonical phone is re-asked and the registry is never called", async () => {
+test("getcode registry flow: a non-canonical phone proceeds to the name step and the registry is never called", async () => {
   const fetchImpl = registryStubFetch({ entries: {} });
   const parity = makeParity({ registrySecret: REGISTRY_SECRET, fetchImpl });
   await parity.handleText(USER_PSID, "/getcode");
-  const retry = await parity.handleText(USER_PSID, "١٢٠٧٨٢٩٣");
-  assert.match(retry.texts[0].text, /٤ أرقام على الأقل/u);
+  const askName = await parity.handleText(USER_PSID, "١٢٠٧٨٢٩٣");
+  assert.match(askName.texts[0].text, /اسمك الثلاثي/u, "an 8-digit phone is accepted, not re-asked");
   assert.equal(fetchImpl.calls.length, 0, "no lookup without a canonical phone");
 });
 
