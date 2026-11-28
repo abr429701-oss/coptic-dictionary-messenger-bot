@@ -114,10 +114,10 @@ function makeParity(deps = {}) {
 // Audit
 // ---------------------------------------------------------------------------
 
-test("admin audit covers all 332 Telegram commands exactly once, plus 2 Messenger extras", () => {
+test("admin audit covers all 332 Telegram commands exactly once, plus 3 Messenger extras", () => {
   const counts = adminAuditCounts();
-  assert.equal(counts.total, 334);
-  assert.equal(counts.impl, 248);
+  assert.equal(counts.total, 335);
+  assert.equal(counts.impl, 249);
   assert.equal(counts.dispatch, 12);
   assert.equal(counts.na, 74);
   const seen = new Set();
@@ -547,6 +547,197 @@ test("get-code /cancel clears the screenshot wait but keeps the record", async (
   assert.equal(await parity.handleImage(USER_PSID), null, "the wait is gone after /cancel");
   const again = await parity.handleText(USER_PSID, "/getcode");
   assert.match(again.texts[0].text, /مرحباً، لمياء وائل شرف، الرقم الكودي الخاص بك هو 13312860/u, "the record survives /cancel");
+});
+
+// /resetcode (28 Nov 2026, Telegram parity): hidden admin-only — the
+// admin already has a stored code, so /getcode only greets him and he
+// can never re-test the full flow. It clears his own stored record
+// (and any open wait), so the next /getcode asks for the name again.
+// Same phone → same code (the code is derived from the phone); the
+// reset re-opens the FLOW, it never mints a new code.
+test("get-code /resetcode (admin) clears the stored record and the next /getcode asks for the name again", async () => {
+  const parity = makeParity();
+  await parity.handleText(ADMIN_PSID, "/getcode");
+  await parity.handleText(ADMIN_PSID, "ابرام مرزق");
+  await parity.handleText(ADMIN_PSID, "١٢٠٧٨٢٩٣");
+  const again = await parity.handleText(ADMIN_PSID, "/getcode");
+  assert.match(again.texts[0].text, /مرحباً، ابرام مرزق/u, "record exists before the reset");
+  const reset = await parity.handleText(ADMIN_PSID, "/resetcode");
+  assert.equal(reset.texts[0].text, "تم مسح الرقم الكودي المسجّل — ابعت /getcode من الأول.");
+  assert.equal(reset.getCodeReply, true, "confirmation rides the direct send, like other get-code replies");
+  const fresh = await parity.handleText(ADMIN_PSID, "/getcode");
+  assert.match(fresh.texts[0].text, /اكتب اسمك الثلاثي/u, "the next /getcode asks for the name again");
+  assert.doesNotMatch(fresh.texts[0].text, /مرحباً/u);
+});
+
+test("get-code /resetcode (non-admin) is silent and the record survives", async () => {
+  const parity = makeParity();
+  await parity.handleText(USER_PSID, "/getcode");
+  await parity.handleText(USER_PSID, "لمياء وائل شرف");
+  await parity.handleText(USER_PSID, "١٢٠٧٨٢٩٣");
+  const reset = await parity.handleText(USER_PSID, "/resetcode");
+  assert.deepEqual(reset.texts, [], "non-admins get silence, no leak of the admin surface");
+  const again = await parity.handleText(USER_PSID, "/getcode");
+  assert.match(again.texts[0].text, /مرحباً، لمياء وائل شرف، الرقم الكودي الخاص بك هو 13312860/u, "the record survives a non-admin /resetcode");
+});
+
+test("get-code /resetcode clears an open screenshot wait too", async () => {
+  const parity = makeParity();
+  await parity.handleText(ADMIN_PSID, "/getcode");
+  await parity.handleText(ADMIN_PSID, "ابرام مرزق");
+  await parity.handleText(ADMIN_PSID, "١٢٠٧٨٢٩٣");
+  await parity.handleText(ADMIN_PSID, "/resetcode");
+  assert.equal(await parity.handleImage(ADMIN_PSID), null, "the wait is gone after /resetcode");
+});
+
+// ---------------------------------------------------------------------------
+// Get-code screenshot OCR verification (28 Nov 2026, Telegram parity)
+// ---------------------------------------------------------------------------
+
+const SHOT_IMAGE = { type: "image", payload: { url: "https://cdn.test/shot.jpg" } };
+
+// Stub fetch dispatching by URL: the Facebook CDN URL returns fake
+// image bytes; api.ocr.space returns the canned OCR text (or an error).
+function ocrStubFetch(ocrText, { ocrError = false, ocrEmpty = false, downloadError = false, imageBytes = null } = {}) {
+  const calls = [];
+  const fetchImpl = async (url, options = {}) => {
+    calls.push(String(url));
+    if (String(url).startsWith("https://api.ocr.space/")) {
+      if (ocrError) return { ok: false, json: async () => null };
+      return {
+        ok: true,
+        json: async () => ({
+          OCRExitCode: 1, IsErroredOnProcessing: false,
+          ParsedResults: [{ ParsedText: ocrEmpty ? "" : ocrText }],
+        }),
+      };
+    }
+    if (downloadError) return { ok: false, arrayBuffer: async () => new ArrayBuffer(0) };
+    const bytes = imageBytes ?? new TextEncoder().encode("fake-jpg-bytes");
+    return { ok: true, arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) };
+  };
+  fetchImpl.calls = calls;
+  return fetchImpl;
+}
+
+async function openScreenshotWait(parity, psid = USER_PSID) {
+  await parity.handleText(psid, "/getcode");
+  await parity.handleText(psid, "لمياء وائل شرف");
+  await parity.handleText(psid, "١٢٠٧٨٢٩٣"); // code 13312860
+}
+
+test("get-code OCR: saved name + code present → activation, wait clears", async () => {
+  const fetchImpl = ocrStubFetch("Coptic Dictionary\nتم التسجيل، الرقم الكودي الخاص بي: 13312860، اسمي: لمياء وائل شرف");
+  const parity = makeParity({ ocrApiKey: "test-ocr-key", fetchImpl });
+  await openScreenshotWait(parity);
+  const shot = await parity.handleImage(USER_PSID, SHOT_IMAGE);
+  assert.match(shot.texts[0].text, /تم تفعيل اشتراكك عزيزنا، لمياء وائل شرف والرقم الكودي الخاص بك هو: 13312860/u);
+  assert.ok(fetchImpl.calls.some((u) => u.startsWith("https://api.ocr.space/")), "OCR was called");
+  assert.equal(await parity.handleImage(USER_PSID, SHOT_IMAGE), null, "a second image does not repeat the activation");
+});
+
+test("get-code OCR: any saved name counts — a non-Coptic name accepts too", async () => {
+  const fetchImpl = ocrStubFetch("أحمد محمد\nتم التسجيل، الرقم الكودي الخاص بي: 13312860، اسمي: لمياء وائل شرف");
+  const parity = makeParity({ ocrApiKey: "test-ocr-key", fetchImpl });
+  await openScreenshotWait(parity);
+  const shot = await parity.handleImage(USER_PSID, SHOT_IMAGE);
+  assert.match(shot.texts[0].text, /تم تفعيل اشتراكك عزيزنا/u, "no specific name is ever checked");
+});
+
+test("get-code OCR: number showing unsaved → exact rejection, wait stays open, good re-send activates", async () => {
+  const unsavedForms = [
+    "+201207829388",
+    "+20 120 782 9388",
+    "01207829388",
+    "٠١٢٠٧٨٢٩٣٨٨",
+  ];
+  for (const form of unsavedForms) {
+    const fetchImpl = ocrStubFetch(`${form}\nتم التسجيل، الرقم الكودي الخاص بي: 13312860، اسمي: لمياء وائل شرف`);
+    const parity = makeParity({ ocrApiKey: "test-ocr-key", fetchImpl });
+    await openScreenshotWait(parity);
+    const rejected = await parity.handleImage(USER_PSID, SHOT_IMAGE);
+    assert.equal(
+      rejected.texts[0].text,
+      "قم برفع صورة مضبوطة تُوضح أن الرقم مسجل في جهات اتصالك.",
+      `unsaved form ${form} gets the exact rejection text`,
+    );
+    // The wait stays open: the same unsaved screenshot is rejected again.
+    const retry = await parity.handleImage(USER_PSID, SHOT_IMAGE);
+    assert.equal(
+      retry.texts[0].text,
+      "قم برفع صورة مضبوطة تُوضح أن الرقم مسجل في جهات اتصالك.",
+      "the wait is still open on a repeated unsaved screenshot",
+    );
+  }
+});
+
+test("get-code OCR: rejected unsaved screenshot, then a good re-send activates", async () => {
+  let ocrText = "+201207829388\nتم التسجيل، الرقم الكودي الخاص بي: 13312860، اسمي: لمياء وائل شرف";
+  const fetchImpl = async (url) => {
+    if (String(url).startsWith("https://api.ocr.space/")) {
+      return {
+        ok: true,
+        json: async () => ({ OCRExitCode: 1, IsErroredOnProcessing: false, ParsedResults: [{ ParsedText: ocrText }] }),
+      };
+    }
+    return { ok: true, arrayBuffer: async () => new TextEncoder().encode("fake-jpg").buffer };
+  };
+  const parity = makeParity({ ocrApiKey: "test-ocr-key", fetchImpl });
+  await openScreenshotWait(parity);
+  const rejected = await parity.handleImage(USER_PSID, SHOT_IMAGE);
+  assert.equal(rejected.texts[0].text, "قم برفع صورة مضبوطة تُوضح أن الرقم مسجل في جهات اتصالك.");
+  ocrText = "Coptic Dictionary\nتم التسجيل، الرقم الكودي الخاص بي: 13312860، اسمي: لمياء وائل شرف";
+  const activated = await parity.handleImage(USER_PSID, SHOT_IMAGE);
+  assert.match(activated.texts[0].text, /تم تفعيل اشتراكك عزيزنا/u, "a good re-send activates after the rejection");
+});
+
+test("get-code OCR: code missing → no-code rejection, wait stays open", async () => {
+  const fetchImpl = ocrStubFetch("Coptic Dictionary\nتم التسجيل");
+  const parity = makeParity({ ocrApiKey: "test-ocr-key", fetchImpl });
+  await openScreenshotWait(parity);
+  const rejected = await parity.handleImage(USER_PSID, SHOT_IMAGE);
+  assert.equal(rejected.texts[0].text, "⚠️ رسالة التسجيل مش ظاهرة في السكرين — اتأكد إنك بعت الرسالة على الواتساب، وبعدين ابعت سكرين شوت تاني.");
+  const again = await parity.handleImage(USER_PSID, SHOT_IMAGE);
+  assert.equal(again.texts[0].text, "⚠️ رسالة التسجيل مش ظاهرة في السكرين — اتأكد إنك بعت الرسالة على الواتساب، وبعدين ابعت سكرين شوت تاني.", "the wait stays open after a no-code rejection");
+});
+
+test("get-code OCR: no key configured → skipped, activation as before, zero OCR calls", async () => {
+  const fetchImpl = ocrStubFetch("Coptic Dictionary\nتم التسجيل، الرقم الكودي الخاص بي: 13312860، اسمي: لمياء وائل شرف");
+  const parity = makeParity({ fetchImpl }); // no ocrApiKey
+  await openScreenshotWait(parity);
+  const shot = await parity.handleImage(USER_PSID, SHOT_IMAGE);
+  assert.match(shot.texts[0].text, /تم تفعيل اشتراكك عزيزنا/u);
+  assert.equal(fetchImpl.calls.length, 0, "no download and no OCR call without a key");
+});
+
+test("get-code OCR: OCR error / empty text / download failure → fail open to activation", async () => {
+  const cases = [
+    ocrStubFetch("ignored", { ocrError: true }),
+    ocrStubFetch("ignored", { ocrEmpty: true }),
+    ocrStubFetch("ignored", { downloadError: true }),
+  ];
+  for (const fetchImpl of cases) {
+    const parity = makeParity({ ocrApiKey: "test-ocr-key", fetchImpl });
+    await openScreenshotWait(parity);
+    const shot = await parity.handleImage(USER_PSID, SHOT_IMAGE);
+    assert.match(shot.texts[0].text, /تم تفعيل اشتراكك عزيزنا/u, "any OCR problem fails open to the activation reply");
+  }
+});
+
+test("get-code OCR: oversize image → skipped, activation, no OCR call", async () => {
+  const fetchImpl = ocrStubFetch("ignored", { imageBytes: new Uint8Array(1048577) });
+  const parity = makeParity({ ocrApiKey: "test-ocr-key", fetchImpl });
+  await openScreenshotWait(parity);
+  const shot = await parity.handleImage(USER_PSID, SHOT_IMAGE);
+  assert.match(shot.texts[0].text, /تم تفعيل اشتراكك عزيزنا/u);
+  assert.ok(!fetchImpl.calls.some((u) => u.startsWith("https://api.ocr.space/")), "oversize images never reach OCR.space");
+});
+
+test("get-code OCR: image with no wait stays silent even with a key configured", async () => {
+  const fetchImpl = ocrStubFetch("Coptic Dictionary\nتم التسجيل، الرقم الكودي الخاص بي: 13312860، اسمي: لمياء وائل شرف");
+  const parity = makeParity({ ocrApiKey: "test-ocr-key", fetchImpl });
+  assert.equal(await parity.handleImage(USER_PSID, SHOT_IMAGE), null);
+  assert.equal(fetchImpl.calls.length, 0, "no download without an open wait");
 });
 
 // ---------------------------------------------------------------------------

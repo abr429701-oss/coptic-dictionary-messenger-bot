@@ -74,6 +74,9 @@ import {
   buildGetCodeReply,
   getCodePhoneValid,
   GET_CODE_EXAMPLE_PHOTO_URL,
+  GET_CODE_SCREENSHOT_UNSAVED_TEXT,
+  GET_CODE_SCREENSHOT_NO_CODE_TEXT,
+  verifyScreenshotOcr,
 } from "./getcode.js";
 import { copticNameReply } from "./coptic-name.js";
 import { buildQuickReplies, plainTextCard } from "./messenger.js";
@@ -685,8 +688,8 @@ export function formatLiveForward({ name, psid, at, kind, text }) {
 //   na       — inherently Telegram-only: listed explicitly with a reason,
 //              never silently dropped.
 //
-// Counts (see ADMIN_AUDIT / adminAuditCounts()): impl 245, dispatch 12,
-// na 77 = 334 (332 Telegram commands + 2 Messenger extras).
+// Counts (see ADMIN_AUDIT / adminAuditCounts()): impl 249, dispatch 12,
+// na 74 = 335 (332 Telegram commands + 3 Messenger extras).
 // ---------------------------------------------------------------------------
 
 export const ADMIN_CATEGORIES = [
@@ -824,10 +827,15 @@ export const ADMIN_DISPATCH_COMMANDS = new Set([
   "search", "random",
 ]);
 
-// The 2 Messenger extras beyond the 332 Telegram commands.
+// The 3 Messenger extras beyond the 332 Telegram commands.
 export const ADMIN_MESSENGER_EXTRAS = [
   { command: "reload", category: "messenger", status: "impl", reason: "تقرير تحديث البيانات (إضافة من منفذ واتساب)" },
   { command: "bans", category: "messenger", status: "impl", reason: "اسم مختصر لـ /banlist" },
+  // /resetcode (28 Nov 2026): hidden admin-only — clears the caller's
+  // own stored get-code record so the full flow can be re-tested. It
+  // is NOT in any category list or menu; it lives here only so it is
+  // admin-gated (ADMIN_COMMANDS) and silent for non-admins.
+  { command: "resetcode", category: "messenger", status: "impl", reason: "مسح الرقم الكودي المسجّل لإعادة اختبار تدفق الرقم الكودي (أدمن فقط، مخفي)" },
 ];
 
 // The full audit: one row per command. Status: impl | dispatch | na.
@@ -1096,7 +1104,8 @@ export function createMessengerParity(deps = {}) {
     deleteVoice = null, // (wordId) => boolean — Telegram-pipeline stub for voice_delete_all/_many only
     putRecording = null, // (r2Key, bytes, contentType) => { ok, error } — R2 upload for /record
     deleteRecording = null, // (r2Key) => { ok, error } — R2 delete for /voice_delete
-    fetchImpl = null, // fetch for downloading the admin's audio attachment
+    fetchImpl = null, // fetch for downloading the admin's audio attachment (and get-code screenshot images for OCR)
+    ocrApiKey = null, // OCR.space free API key for get-code screenshot verification (OCR_SPACE_API_KEY wrangler secret); null = OCR skipped, fail open
     searchWords = null, // (query) => [{ id, coptic, pronunciation, english, meaning }] — for /record_choose
     nextUnrecorded = null, // (recordedIds:Set<string>) => { id, coptic, ... , recorded, total } | null — for /record
     getBroadcastControl = null, // () => { paused, speed } | null
@@ -1543,24 +1552,61 @@ export function createMessengerParity(deps = {}) {
     return { ...textPlan(`⚠️ تعذّر إحضار الرقم الكودي مباشرة من البوت حاليًا.\n\n${LEARN_GET_CODE_TEXT}`), getCodeReply: true };
   }
 
-  // Get-code screenshot (28 Nov 2026, Telegram's exact behavior): after
-  // the code reply, the student sends the WhatsApp screenshot back —
-  // confirm the activation with their name + code from the
-  // just-completed session. One shot: only the wait flag clears on
-  // receipt (the stored name+code persist for returning users), so a
+  // Get-code screenshot (28 Nov 2026, Telegram's exact behavior + OCR
+  // verification): after the code reply, the student sends the WhatsApp
+  // screenshot back. On the WEBHOOK path the image arrives with its
+  // Facebook CDN attachment URL (image.payload.url — expires, so it is
+  // downloaded immediately) and is OCR-verified FIRST: the admin number
+  // showing as raw digits (unsaved) or a missing code are REJECTED with
+  // the wait left open so the student can re-send; any OCR problem fails
+  // open to the activation below. On the /botcake path the image arrives
+  // as an empty-text call with NO bytes (image is null) — OCR cannot
+  // run there, so it always fails open to the activation. Only an
+  // accepted screenshot confirms the activation with their name + code
+  // from the just-completed session. One shot: only the wait flag clears
+  // on receipt (the stored name+code persist for returning users), so a
   // later unrelated image does not repeat it. An image without a
   // completed get-code session returns null (normal handling — on the
   // webhook path that means silence, as today). The plan carries
   // getCodeReply so the /botcake path direct-sends it (the flow would
   // drop it otherwise); on the webhook path the flag is ignored and
   // the text is sent directly.
-  async function handleImage(senderId) {
+  async function handleImage(senderId, image = null) {
     const state = await load(senderId);
     if (state?.getcodeScreenshotAwaiting && state?.getcodeScreenshotName && state?.getcodeScreenshotCode) {
+      const imageUrl = image?.payload?.url ?? null;
+      const verdict = await verifyGetCodeScreenshot(imageUrl, state.getcodeScreenshotCode);
+      if (verdict === "unsaved-number") {
+        return { ...textPlan(GET_CODE_SCREENSHOT_UNSAVED_TEXT), getCodeReply: true };
+      }
+      if (verdict === "no-code") {
+        return { ...textPlan(GET_CODE_SCREENSHOT_NO_CODE_TEXT), getCodeReply: true };
+      }
       await commit(senderId, state, { getcodeScreenshotAwaiting: undefined });
       return { ...textPlan(`تم تفعيل اشتراكك عزيزنا، ${state.getcodeScreenshotName} والرقم الكودي الخاص بك هو: ${state.getcodeScreenshotCode}`), getCodeReply: true };
     }
     return null;
+  }
+
+  // Screenshot OCR verification (2026-11-28): download the image from
+  // its Facebook CDN URL and OCR it (OCR.space, key from the
+  // OCR_SPACE_API_KEY secret — see verifyScreenshotOcr in
+  // src/getcode.js). No URL (the /botcake empty-text hook), no key, a
+  // failed download, or any OCR problem → "skipped": the caller FAILS
+  // OPEN and activates as before, so a legit student is never stranded
+  // by the OCR service being down.
+  async function verifyGetCodeScreenshot(imageUrl, code) {
+    const apiKey = String(ocrApiKey ?? "").trim();
+    if (!apiKey || !imageUrl) return "skipped";
+    try {
+      const fetchFn = fetchImpl ?? globalThis.fetch;
+      const response = await fetchFn(String(imageUrl), { signal: AbortSignal.timeout(15000) });
+      if (!response?.ok) return "skipped";
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      return (await verifyScreenshotOcr(bytes, code, apiKey, fetchFn)).verdict;
+    } catch {
+      return "skipped";
+    }
   }
 
   // -- exams -----------------------------------------------------------------
@@ -3414,6 +3460,24 @@ export function createMessengerParity(deps = {}) {
           return certLevelPickerPlan(senderId, state);
         case "getcode":
           return beginGetCodeFlow(senderId, state);
+        case "resetcode": {
+          // Hidden admin-only (28 Nov 2026, Telegram parity): the admin
+          // already has a stored code, so /getcode only greets him and
+          // never re-asks — this clears his own stored name+code (and
+          // any open get-code wait), so the next /getcode asks for name,
+          // then phone, and runs the full flow again. Same phone → same
+          // code (last 8 digits + 1234567); the reset re-opens the FLOW,
+          // it never mints a new code. Non-admins never reach here
+          // (ADMIN_COMMANDS gate above returns silence). getCodeReply
+          // rides the Worker's direct send so the Botcake flow cannot
+          // drop the confirmation.
+          await commit(senderId, state, {
+            getcodeStep: undefined, getcodeName: undefined,
+            getcodeScreenshotAwaiting: undefined,
+            getcodeScreenshotName: undefined, getcodeScreenshotCode: undefined,
+          });
+          return { ...textPlan("تم مسح الرقم الكودي المسجّل — ابعت /getcode من الأول."), getCodeReply: true };
+        }
         case "cancel": {
           if (state.copticNameAwaiting) {
             await commit(senderId, state, { copticNameAwaiting: undefined });

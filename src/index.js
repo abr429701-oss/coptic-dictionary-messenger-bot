@@ -1221,6 +1221,10 @@ export default {
           }
         },
         fetchImpl: globalThis.fetch,
+        // Get-code screenshot OCR (28 Nov 2026): the OCR.space free key
+        // from the OCR_SPACE_API_KEY wrangler secret; unset = OCR
+        // skipped (fail open). The parent sets the secret after deploy.
+        ocrApiKey: env.OCR_SPACE_API_KEY ?? null,
         searchWords: async (query) => {
           // /record_choose candidates: the same dictionary search the
           // bot uses, capped at 15 (one Messenger list page).
@@ -1294,10 +1298,11 @@ export default {
           }
           // A captioned image (photo with a caption): the caption is
           // the text, but the image also answers the get-code screenshot
-          // wait — check it first; handleImage returns null when no
-          // wait is open and the turn flows on normally.
+          // wait — check it first, passing the attachment so the OCR
+          // verification can download it; handleImage returns null when
+          // no wait is open and the turn flows on normally.
           if (senderId != null && Array.isArray(attachments) && attachments.some((a) => a?.type === "image")) {
-            const imgPlan = await messengerParity.handleImage(senderId);
+            const imgPlan = await messengerParity.handleImage(senderId, attachments.find((a) => a?.type === "image"));
             if (imgPlan) return imgPlan;
           }
           // Deep link (Telegram parity): a tapped share link opens the
@@ -1392,11 +1397,13 @@ export default {
         },
         // An image message (photo attachment, no text): only the
         // get-code screenshot wait owns it — handleImage answers the
-        // activation, or null (silence) when no wait is open. The live
-        // monitor logs it as media before the wait decides.
+        // activation (OCR-verified on the webhook path; fail-open on the
+        // /botcake empty-text path, which carries no image bytes), or
+        // null (silence) when no wait is open. The live monitor logs
+        // it as media before the wait decides.
         image: async (attachment, senderId) => {
           await liveMonitorHook(senderId, "media", "");
-          return messengerParity.handleImage(senderId);
+          return messengerParity.handleImage(senderId, attachment);
         },
         executeTask: (task, senderId, fetchImpl) => executeMessengerTask(env, task, senderId, fetchImpl, { ctx }),
       };

@@ -50,7 +50,7 @@ function recordingFetch(calls, macroResponse) {
   };
 }
 
-async function postBotcake(body, kv, calls, macroResponse) {
+async function postBotcake(body, kv, calls, macroResponse, envExtra = {}) {
   const restoreFetch = globalThis.fetch;
   globalThis.fetch = recordingFetch(calls, macroResponse);
   const tasks = [];
@@ -66,6 +66,7 @@ async function postBotcake(body, kv, calls, macroResponse) {
       APPS_SCRIPT_URL: MACRO_URL,
       USERS: kv,
       RECORDED_AUDIO_BASE_URL: "https://example.r2.dev",
+      ...envExtra,
     }, ctx);
     assert.equal(response.status, 200);
     const envelope = await response.json();
@@ -238,4 +239,25 @@ test("get-code empty-text turn with no wait: silence, no activation", async () =
   const { envelope } = await postBotcake({ psid: PSID, text: "" }, kv, calls, { success: true, code: "90488651" });
   assert.equal(envelope.text, "", "nothing in the envelope");
   assert.ok(!directTextSends(calls).some((d) => /تم تفعيل اشتراكك/u.test(d.body.message.text)), "no activation reply without a wait");
+});
+
+// OCR (28 Nov 2026): the /botcake empty-text hook carries NO image
+// bytes, so it cannot OCR — it must fail open to the activation even
+// when the OCR key is configured, and never call api.ocr.space.
+test("get-code screenshot: empty-text turn with OCR key set still activates, never calls OCR", async () => {
+  const kv = fakeKv();
+  seedGetCodeDone(kv, { wait: true });
+  const calls = [];
+  const { envelope } = await postBotcake(
+    { psid: PSID, text: "" },
+    kv,
+    calls,
+    { success: true, code: "90488651" },
+    { OCR_SPACE_API_KEY: "test-ocr-key" },
+  );
+  assert.equal(envelope.text, "", "envelope text cleared after direct send");
+  const direct = directTextSends(calls);
+  assert.equal(direct.length, 1, "exactly one activation reply");
+  assert.match(direct[0].body.message.text, /تم تفعيل اشتراكك عزيزنا، أحمد محمد والرقم الكودي الخاص بك هو: 90488651/u);
+  assert.ok(!calls.some((c) => String(c.url).startsWith("https://api.ocr.space/")), "no OCR call without image bytes");
 });
