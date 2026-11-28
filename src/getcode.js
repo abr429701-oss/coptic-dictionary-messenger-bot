@@ -119,7 +119,12 @@ export function normalizeOcrDigits(text) {
 // same way: strip Arabic diacritics (tashkeel) and tatweel, unify
 // أ/إ/آ → ا, ى → ي, ة → ه, drop spaces and punctuation, lowercase
 // Latin. The normalized full name must appear in the normalized OCR
-// text.
+// text. Only Arabic letters, Latin letters and digits are CHECKABLE:
+// OCR.space (Arabic+English+digits) never returns Coptic or Greek
+// letters, so a Coptic/Greek-only name normalizes to "" here and the
+// name check is skipped — the code-digit check still applies, so a
+// correct screenshot is never rejected for its name's script. A mixed
+// name (Arabic + Coptic) is checked on its Arabic part.
 export function normalizeOcrName(text) {
   return String(text ?? "")
     .replace(/[\u064B-\u0655\u0670\u0640]/gu, "")
@@ -127,7 +132,7 @@ export function normalizeOcrName(text) {
     .replace(/ى/gu, "ي")
     .replace(/ة/gu, "ه")
     .toLowerCase()
-    .replace(/[^\p{L}\p{N}]/gu, "");
+    .replace(/[^0-9A-Za-z\u0600-\u06FF]/gu, "");
 }
 
 // The user's rule (2026-11-28): the screenshot is REJECTED when the

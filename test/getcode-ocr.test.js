@@ -114,6 +114,30 @@ test("checkScreenshotOcrText: empty stored name skips the name check (fail open)
   );
 });
 
+test("checkScreenshotOcrText: Coptic/Greek-only names skip the name check (OCR cannot read those scripts)", () => {
+  // OCR.space reads Arabic+English+digits only, so a Coptic/Greek name
+  // can never appear in the OCR text — the name check must not reject
+  // a correct screenshot for its name's script. The code check is the
+  // strict gate and still applies.
+  assert.deepEqual(
+    checkScreenshotOcrText("Coptic\nتم التسجيل، الرقم الكودي الخاص بي: 13312860، اسمي: Ⲁⲃⲣⲁⲁⲙ", "13312860", "Ⲁⲃⲣⲁⲁⲙ"),
+    { verdict: "ok" },
+  );
+  assert.deepEqual(
+    checkScreenshotOcrText("Coptic\nتم التسجيل، الرقم الكودي الخاص بي: 13312860، اسمي: Αβραάμ", "13312860", "Αβραάμ"),
+    { verdict: "ok" },
+  );
+  // Mixed Arabic+Coptic: the Arabic part is still checked.
+  assert.deepEqual(
+    checkScreenshotOcrText("Coptic\nتم التسجيل، الرقم الكودي الخاص بي: 13312860، اسمي: ابرام Ⲁⲃⲣⲁⲁⲙ", "13312860", "ابرام Ⲁⲃⲣⲁⲁⲙ"),
+    { verdict: "ok" },
+  );
+  assert.deepEqual(
+    checkScreenshotOcrText("Coptic\nتم التسجيل، الرقم الكودي الخاص بي: 13312860، اسمي: أحمد محمد", "13312860", "ابرام Ⲁⲃⲣⲁⲁⲙ"),
+    { verdict: "name-mismatch" },
+  );
+});
+
 function ocrFetch(result) {
   return async (url) => {
     assert.equal(String(url), OCR_SPACE_API_URL);
