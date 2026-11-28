@@ -76,6 +76,11 @@ import {
   GET_CODE_EXAMPLE_PHOTO_URL,
   GET_CODE_SCREENSHOT_UNSAVED_TEXT,
   verifyScreenshotOcr,
+  canonicalGetCodePhone,
+  getCodeRegistryLookup,
+  storeCodeRegistryEntry,
+  deleteCodeRegistryEntry,
+  GETCODE_REGISTRY_BASE_URL,
 } from "./getcode.js";
 import { copticNameReply } from "./coptic-name.js";
 import { buildQuickReplies, plainTextCard } from "./messenger.js";
@@ -1105,6 +1110,14 @@ export function createMessengerParity(deps = {}) {
     deleteRecording = null, // (r2Key) => { ok, error } — R2 delete for /voice_delete
     fetchImpl = null, // fetch for downloading the admin's audio attachment (and get-code screenshot images for OCR)
     ocrApiKey = null, // OCR.space free API key for get-code screenshot verification (OCR_SPACE_API_KEY wrangler secret); null = OCR skipped, fail open
+    // Shared get-code registry (28 Nov 2026, cross-platform sync): the
+    // Telegram Worker's /getcode-registry endpoints, behind the SAME
+    // GETCODE_REGISTRY_SECRET the Telegram Worker uses (wrangler
+    // secret on this Worker too). Null/empty secret = registry
+    // disabled — every lookup is a miss, writes are skipped, the flow
+    // runs exactly as before (fail open).
+    getcodeRegistryBaseUrl = GETCODE_REGISTRY_BASE_URL,
+    getcodeRegistrySecret = null,
     searchWords = null, // (query) => [{ id, coptic, pronunciation, english, meaning }] — for /record_choose
     nextUnrecorded = null, // (recordedIds:Set<string>) => { id, coptic, ... , recorded, total } | null — for /record
     getBroadcastControl = null, // () => { paused, speed } | null
@@ -1185,6 +1198,12 @@ export function createMessengerParity(deps = {}) {
     pendingBroadcast: undefined, pendingConfirm: undefined, menuList: undefined,
     recordState: undefined, recordPick: undefined, scheduleFlow: undefined,
   };
+
+  // Shared get-code registry call options (28 Nov 2026): the Telegram
+  // Worker base URL + the shared secret + the injected fetch (tests
+  // stub it; production passes globalThis.fetch). Without a secret the
+  // client never calls — every lookup is a miss, writes are skipped.
+  const registryOpts = () => ({ baseUrl: getcodeRegistryBaseUrl, secret: getcodeRegistrySecret, fetchImpl });
 
   // -- voice recording (/record) -------------------------------------------
   // Telegram's /record flow (final-code-fix src/index.js), adapted:
@@ -1483,11 +1502,24 @@ export function createMessengerParity(deps = {}) {
     // next completes the activation instead of being searched as a
     // word. Already-activated users get the greeting only — no wait,
     // so a stray photo/like later cannot re-trigger the activation.
+    // 28 Nov 2026 (user order — the code must NEVER be revealed before
+    // the screenshot is accepted): the greeting above reveals the code,
+    // so it goes ONLY to activated users. A record that never
+    // activated must NOT greet with the code: coming back resumes the
+    // screenshot wait — the notice (text + example photo) is re-sent
+    // so the student uploads the screenshot, and the code is revealed
+    // only after the screenshot is accepted.
     if (state?.getcodeScreenshotName && state?.getcodeScreenshotCode) {
-      if (!state.getcodeActivated) {
-        await commit(senderId, state, { getcodeScreenshotAwaiting: true });
+      if (state.getcodeActivated) {
+        return { ...textPlan(`مرحباً ${state.getcodeScreenshotName}، الرقم الكودي الخاص بك هو ${state.getcodeScreenshotCode}`), getCodeReply: true };
       }
-      return { ...textPlan(`مرحباً ${state.getcodeScreenshotName}، الرقم الكودي الخاص بك هو ${state.getcodeScreenshotCode}`), getCodeReply: true };
+      await commit(senderId, state, { getcodeScreenshotAwaiting: true });
+      return {
+        texts: [{ text: buildGetCodeReply(state.getcodeScreenshotName, state.getcodeScreenshotCode) }],
+        voiceUrl: null,
+        attachments: [{ type: "image", url: GET_CODE_EXAMPLE_PHOTO_URL }],
+        getCodePhotoReply: true,
+      };
     }
     await commit(senderId, state, {
       ...clearFlows, getcodeStep: "phone", getcodePhone: undefined,
@@ -1519,10 +1551,29 @@ export function createMessengerParity(deps = {}) {
     // validated and held in getcodePhone until the name step calls the
     // macro with (name, phone). The macro gets the folded phone as
     // typed (Western digits), never the canonical registry form.
+    // The phone must canonicalize (Telegram's rule: the 12-digit
+    // "20..." form) — anything else is re-asked, exactly like
+    // Telegram. A registry hit greets immediately with the stored
+    // name+code (the student already got their code — and passed the
+    // screenshot check — on another platform); entries are written
+    // only at activation time, so a hit is always an activated
+    // student. Any registry error/timeout → miss path (fail open —
+    // never strand a student).
     if (state.getcodeStep === "phone") {
       const phone = normalizeGetCodePhoneMsgr(text);
-      if (!getCodePhoneValidMsgr(phone)) {
+      const canonical = canonicalGetCodePhone(phone);
+      if (!canonical) {
         return textPlan("📱 رقم الموبايل لازم يكون ٤ أرقام على الأقل — اكتبه تاني:");
+      }
+      const hit = await getCodeRegistryLookup(canonical, registryOpts());
+      if (hit?.found && hit.code) {
+        await commit(senderId, state, {
+          getcodeStep: undefined, getcodeName: undefined, getcodePhone: phone,
+          getcodeScreenshotAwaiting: undefined,
+          getcodeScreenshotName: hit.name, getcodeScreenshotCode: String(hit.code),
+          getcodeActivated: true,
+        });
+        return { ...textPlan(`مرحباً ${hit.name}، الرقم الكودي الخاص بك هو ${hit.code}`), getCodeReply: true };
       }
       await commit(senderId, state, { getcodeStep: "name", getcodePhone: phone });
       return textPlan("✏️ اكتب اسمك الثلاثي:");
@@ -1530,6 +1581,14 @@ export function createMessengerParity(deps = {}) {
     const name = String(text ?? "").trim();
     if (!name) return textPlan("✏️ اكتب اسمك الثلاثي:");
     const phone = String(state.getcodePhone ?? "").trim();
+    // The phone is already known (canonical, from the phone step). If
+    // it is missing — e.g. a stale record — go back to the phone
+    // question instead of guessing (Telegram parity).
+    const canonical = canonicalGetCodePhone(phone);
+    if (!canonical) {
+      await commit(senderId, state, { getcodeStep: "phone", getcodeName: undefined });
+      return textPlan("📱 اكتب رقم موبايلك:");
+    }
     await commit(senderId, state, { getcodeStep: undefined, getcodePhone: undefined, getcodeScreenshotAwaiting: undefined });
     let result;
     try {
@@ -1542,14 +1601,19 @@ export function createMessengerParity(deps = {}) {
       // their code back without re-asking), and the one-shot screenshot
       // wait opens — it ends when the photo arrives, or on /cancel,
       // /menu, /start or another menu tap (same clearing as the other
-      // waits; only the wait flag clears, never the record).
+      // waits; only the wait flag clears, never the record). The phone
+      // is KEPT in the record (for /resetcode and for the
+      // activation-time registry write). NO registry write here: the
+      // entry is written ONLY at activation time (when the screenshot
+      // is accepted), so a registry hit always means an activated
+      // student.
       // Get-code reply: text FIRST, then the example screenshot image
       // (Messenger has no photo captions — same words, same order as
       // Telegram's captioned photo). The Worker direct-sends both whole
       // (getCodePhotoReply block in src/index.js, like /share) so the
       // long wa.me link never hits the Botcake chunk splitter.
       await commit(senderId, state, {
-        getcodeStep: undefined, getcodeName: undefined, getcodePhone: undefined,
+        getcodeStep: undefined, getcodeName: undefined, getcodePhone: phone,
         getcodeScreenshotAwaiting: true, getcodeScreenshotName: name, getcodeScreenshotCode: String(result.code),
       });
       return {
@@ -1602,6 +1666,15 @@ export function createMessengerParity(deps = {}) {
       const verdict = await verifyGetCodeScreenshot(imageUrl, state.getcodeScreenshotCode, state.getcodeScreenshotName);
       if (verdict === "unsaved-number" || verdict === "no-code") {
         return { ...textPlan(GET_CODE_SCREENSHOT_UNSAVED_TEXT), getCodeReply: true };
+      }
+      // Activation-time registry write (28 Nov 2026 — the entry is
+      // written ONLY here, never at macro-success time): the student
+      // just proved the screenshot, so the other platforms may
+      // recognize them instantly by phone. Fail-open: a registry
+      // outage must never block the activation reply.
+      const canonical = canonicalGetCodePhone(state.getcodePhone ?? "");
+      if (canonical) {
+        try { await storeCodeRegistryEntry(canonical, state.getcodeScreenshotName, state.getcodeScreenshotCode, registryOpts()); } catch { /* fail open */ }
       }
       await commit(senderId, state, { getcodeScreenshotAwaiting: undefined, getcodeActivated: true });
       return { ...textPlan(`تم تفعيل اشتراكك عزيزنا ${state.getcodeScreenshotName} والرقم الكودي الخاص بك هو: ${state.getcodeScreenshotCode}`), getCodeReply: true };
@@ -3491,7 +3564,12 @@ export function createMessengerParity(deps = {}) {
           // it never mints a new code. Non-admins never reach here
           // (ADMIN_COMMANDS gate above returns silence). getCodeReply
           // rides the Worker's direct send so the Botcake flow cannot
-          // drop the confirmation.
+          // drop the confirmation. Also delete the shared registry
+          // entry for the stored phone (when the record has one):
+          // without it the reset would look broken, because the next
+          // /getcode would find the registry entry and greet immediately
+          // instead of re-running the flow.
+          const resetPhone = canonicalGetCodePhone(state?.getcodePhone ?? "");
           await commit(senderId, state, {
             getcodeStep: undefined, getcodeName: undefined,
             getcodePhone: undefined,
@@ -3499,6 +3577,9 @@ export function createMessengerParity(deps = {}) {
             getcodeScreenshotName: undefined, getcodeScreenshotCode: undefined,
             getcodeActivated: undefined,
           });
+          if (resetPhone) {
+            try { await deleteCodeRegistryEntry(resetPhone, registryOpts()); } catch { /* fail open */ }
+          }
           return { ...textPlan("تم مسح الرقم الكودي المسجّل — ابعت /getcode من الأول."), getCodeReply: true };
         }
         case "cancel": {

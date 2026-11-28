@@ -214,3 +214,82 @@ export async function getCodeFromMacro(name, phone, macroUrl, fetchImpl = fetch)
     return { code: null, error: "macro-unreachable" };
   }
 }
+
+// Shared get-code registry (2026-11-28, cross-platform sync — Telegram
+// parity, ~/workspace/final-code-fix/src/getcode.js): ONE phone-keyed
+// record — {name, code, updatedAt} — in the Telegram Worker's UserStore
+// DO, so a student who got their code on Telegram is recognized
+// instantly on Messenger (and vice versa) without re-entering
+// name/phone. The registry key is `getcode:registry:<canonicalPhone>`;
+// the endpoints in the Telegram Worker serve it to the other bots
+// behind `Authorization: Bearer <GETCODE_REGISTRY_SECRET>`.
+export const GETCODE_REGISTRY_BASE_URL = "https://coptic-dictionary-bot.abr429701.workers.dev";
+export const GETCODE_REGISTRY_PATH = "/getcode-registry";
+
+// Canonical phone (2026-11-28, Telegram's rule verbatim): ONE form
+// everywhere — the 12-digit "20..." form. Folds Arabic-Indic/Persian
+// digits first, strips everything else, then: 12 digits starting with
+// "20" → as-is; 11 digits starting with "0" → "2" + digits; 10 digits
+// starting with "1" → "20" + digits. Anything else (too short,
+// foreign, garbage) → null: the caller re-asks for the phone.
+export function canonicalGetCodePhone(phone) {
+  const digits = normalizeOcrDigits(phone);
+  if (digits.length === 12 && digits.startsWith("20")) return digits;
+  if (digits.length === 11 && digits.startsWith("0")) return `2${digits}`;
+  if (digits.length === 10 && digits.startsWith("1")) return `20${digits}`;
+  return null;
+}
+
+export function getCodeRegistryKey(canonicalPhone) {
+  return `getcode:registry:${canonicalPhone}`;
+}
+
+// Registry client: GET/POST/DELETE against the Telegram Worker's
+// /getcode-registry endpoints. Every call FAILS OPEN — any error,
+// timeout, non-2xx or unparsable body returns null/false, never
+// throws, so a registry outage never strands a student (the flow
+// falls back to asking the name / completing locally). `fetchImpl`
+// exists so tests can stub the call; without a secret there is nothing
+// to call (the endpoints reject unauthenticated), so the lookup is a
+// miss and writes are skipped.
+async function registryCall(method, path, { baseUrl, secret, body, fetchImpl } = {}) {
+  const key = String(secret ?? "").trim();
+  if (!key) return null;
+  const fetchFn = fetchImpl ?? globalThis.fetch;
+  try {
+    const resp = await fetchFn(`${String(baseUrl ?? GETCODE_REGISTRY_BASE_URL).replace(/\/$/, "")}${path}`, {
+      method,
+      headers: { authorization: `Bearer ${key}`, ...(body !== undefined ? { "content-type": "application/json" } : {}) },
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!resp?.ok) return null;
+    try { return await resp.json(); } catch { return null; }
+  } catch {
+    return null;
+  }
+}
+
+// GET /getcode-registry?phone=<canonical> → {found, name, code} on a
+// hit, {found:false} on a miss or any error (treat as miss).
+export async function getCodeRegistryLookup(canonicalPhone, opts = {}) {
+  const data = await registryCall("GET", `${GETCODE_REGISTRY_PATH}?phone=${encodeURIComponent(String(canonicalPhone ?? ""))}`, opts);
+  if (!data || data.found !== true || !data.code) return { found: false };
+  return { found: true, name: String(data.name ?? "").trim(), code: String(data.code) };
+}
+
+// POST /getcode-registry {phone, name, code} → true on {ok:true}.
+// Written ONLY at activation time (when the screenshot is accepted) —
+// a registry entry therefore always means an activated student, so a
+// registry-hit greeting is safe. Never throws.
+export async function storeCodeRegistryEntry(canonicalPhone, name, code, opts = {}) {
+  const data = await registryCall("POST", GETCODE_REGISTRY_PATH, { ...opts, body: { phone: String(canonicalPhone ?? ""), name: String(name ?? "").trim(), code: String(code ?? "").trim() } });
+  return Boolean(data?.ok);
+}
+
+// DELETE /getcode-registry?phone=<canonical> → true on {ok:true}.
+// Idempotent (deleting a missing entry still answers ok). Never throws.
+export async function deleteCodeRegistryEntry(canonicalPhone, opts = {}) {
+  const data = await registryCall("DELETE", `${GETCODE_REGISTRY_PATH}?phone=${encodeURIComponent(String(canonicalPhone ?? ""))}`, opts);
+  return Boolean(data?.ok);
+}

@@ -1246,6 +1246,11 @@ export default {
         // from the OCR_SPACE_API_KEY wrangler secret; unset = OCR
         // skipped (fail open). The parent sets the secret after deploy.
         ocrApiKey: env.OCR_SPACE_API_KEY ?? null,
+        // Shared get-code registry (28 Nov 2026, cross-platform sync):
+        // the SAME GETCODE_REGISTRY_SECRET the Telegram Worker uses
+        // (wrangler secret on this Worker too); unset = registry
+        // disabled — every lookup is a miss, writes are skipped.
+        getcodeRegistrySecret: env.GETCODE_REGISTRY_SECRET ?? null,
         searchWords: async (query) => {
           // /record_choose candidates: the same dictionary search the
           // bot uses, capped at 15 (one Messenger list page).

@@ -93,11 +93,12 @@ function seedGetCodeName(kv) {
   });
 }
 
-function seedGetCodeDone(kv, { wait = false } = {}) {
+function seedGetCodeDone(kv, { wait = false, activated = true } = {}) {
   kv.store.set(`user:msgr:${PSID}`, {
     name: "Tester",
     parity: {
       ...(wait ? { getcodeScreenshotAwaiting: true } : {}),
+      ...(activated ? { getcodeActivated: true } : {}),
       getcodeScreenshotName: "أحمد محمد",
       getcodeScreenshotCode: "90488651",
     },
@@ -429,16 +430,22 @@ test("non-image URL text: silence, never searched", async () => {
 
 // Returning user who never activated: the greeting re-opens the wait, so
 // the screenshot sent next completes the activation.
-test("get-code returning user who never activated: greeting re-opens the wait, screenshot then activates", async () => {
+test("get-code returning user who never activated: no code revealed — notice re-sent, wait re-opens, screenshot then activates", async () => {
   const kv = fakeKv();
-  seedGetCodeDone(kv, { wait: false });
+  seedGetCodeDone(kv, { wait: false, activated: false });
   const calls = [];
   const { envelope } = await postBotcake({ psid: PSID, text: "/getcode" }, kv, calls, { success: true, code: "90488651" });
   assert.equal(envelope.text, "", "envelope text cleared after direct send");
   const direct = directTextSends(calls);
-  assert.match(direct.map((d) => d.body.message.text).join("\n"), /مرحباً أحمد محمد، الرقم الكودي الخاص بك هو 90488651/u, "greeting carries the stored name and code");
+  const allDirect = direct.map((d) => d.body.message.text).join("\n");
+  assert.doesNotMatch(allDirect, /مرحباً/u, "no greeting with the code before activation");
+  assert.doesNotMatch(allDirect, /الرقم الكودي الخاص بك هو:/u, "the code is never revealed before the screenshot");
+  assert.match(allDirect, /لتفعيل اشتراكك/u, "the notice is re-sent so the student uploads the screenshot");
+  const images = directImageSends(calls);
+  assert.equal(images.length, 1, "the example photo rides along with the notice");
+  assert.equal(images[0].body.message.attachment.payload.url, "https://pub-e39b5be260724e0ea1bbf6a7db089987.r2.dev/getcode-example.jpg");
   const record = kv.store.get(`user:msgr:${PSID}`);
-  assert.equal(record.parity.getcodeScreenshotAwaiting, true, "the greeting re-opens the wait for a never-activated user");
+  assert.equal(record.parity.getcodeScreenshotAwaiting, true, "the notice re-opens the wait for a never-activated user");
   const calls2 = [];
   await postBotcake({ psid: PSID, text: FBCDN_PHOTO_URL }, kv, calls2, { success: true, code: "90488651" });
   const direct2 = directTextSends(calls2);
