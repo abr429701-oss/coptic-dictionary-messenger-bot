@@ -6,23 +6,19 @@ import assert from "node:assert/strict";
 import {
   GET_CODE_WHATSAPP_NUMBER,
   GET_CODE_SCREENSHOT_UNSAVED_TEXT,
-  GET_CODE_SCREENSHOT_NO_CODE_TEXT,
   OCR_SPACE_API_URL,
   normalizeOcrDigits,
+  normalizeOcrName,
   checkScreenshotOcrText,
   ocrScreenshotText,
   verifyScreenshotOcr,
 } from "../src/getcode.js";
 
-test("OCR rejection texts: unsaved is the user's exact wording, no-code unchanged", () => {
+test("OCR rejection text: ONE text for every screenshot rejection, the user's exact final wording", () => {
   assert.equal(
     GET_CODE_SCREENSHOT_UNSAVED_TEXT,
-    "قم برفع صورة مضبوطة تُوضح أن الرقم مسجل في جهات اتصالك.",
+    "قم برفع صورة مضبوطة تُوضح أن الرقم مسجل في جهات اتصالك، وواضح في الصورة اسمك ورقمك الكودي.",
     "no emoji, no phone number, word-for-word",
-  );
-  assert.equal(
-    GET_CODE_SCREENSHOT_NO_CODE_TEXT,
-    "⚠️ رسالة التسجيل مش ظاهرة في السكرين — اتأكد إنك بعت الرسالة على الواتساب، وبعدين ابعت سكرين شوت تاني.",
   );
 });
 
@@ -36,20 +32,22 @@ test("normalizeOcrDigits: Arabic-Indic and Persian digits fold to Western", () =
 
 test("checkScreenshotOcrText: unsaved number in any form rejects", () => {
   const code = "13312860";
+  const name = "لمياء وائل شرف";
   for (const form of ["+201207829388", "+20 120 782 9388", "01207829388", "٠١٢٠٧٨٢٩٣٨٨", "201207829388"]) {
     assert.deepEqual(
-      checkScreenshotOcrText(`${form}\nتم التسجيل، الرقم الكودي الخاص بي: ${code}`, code),
+      checkScreenshotOcrText(`${form}\nتم التسجيل، الرقم الكودي الخاص بي: ${code}، اسمي: ${name}`, code, name),
       { verdict: "unsaved-number" },
       `form ${form}`,
     );
   }
 });
 
-test("checkScreenshotOcrText: saved name (any language) + code present accepts", () => {
+test("checkScreenshotOcrText: saved name (any language) + own code + own name accepts", () => {
   const code = "13312860";
+  const name = "لمياء وائل شرف";
   for (const header of ["Coptic Dictionary", "أحمد محمد", "John Smith", "القاموس القبطي"]) {
     assert.deepEqual(
-      checkScreenshotOcrText(`${header}\nتم التسجيل، الرقم الكودي الخاص بي: ${code}، اسمي: لمياء وائل شرف`, code),
+      checkScreenshotOcrText(`${header}\nتم التسجيل، الرقم الكودي الخاص بي: ${code}، اسمي: ${name}`, code, name),
       { verdict: "ok" },
       `header ${header}`,
     );
@@ -57,12 +55,63 @@ test("checkScreenshotOcrText: saved name (any language) + code present accepts",
 });
 
 test("checkScreenshotOcrText: code missing rejects as no-code", () => {
-  assert.deepEqual(checkScreenshotOcrText("Coptic Dictionary\nتم التسجيل", "13312860"), { verdict: "no-code" });
-  assert.deepEqual(checkScreenshotOcrText("", "13312860"), { verdict: "no-code" });
+  assert.deepEqual(checkScreenshotOcrText("Coptic Dictionary\nتم التسجيل", "13312860", "لمياء وائل شرف"), { verdict: "no-code" });
+  assert.deepEqual(checkScreenshotOcrText("", "13312860", "لمياء وائل شرف"), { verdict: "no-code" });
 });
 
 test("checkScreenshotOcrText: unsaved number wins over a missing code", () => {
-  assert.deepEqual(checkScreenshotOcrText("+201207829388", "13312860"), { verdict: "unsaved-number" });
+  assert.deepEqual(checkScreenshotOcrText("+201207829388", "13312860", "لمياء وائل شرف"), { verdict: "unsaved-number" });
+});
+
+test("normalizeOcrName: diacritics/tatweel stripped, alef/yeh/teh unified, spaces and punctuation dropped, Latin lowercased", () => {
+  assert.equal(normalizeOcrName("أَحْمَد مُحَمَّد"), "احمدمحمد");
+  assert.equal(normalizeOcrName("لَمْياء وَائِل شَرَف"), "لمياءوائلشرف");
+  assert.equal(normalizeOcrName("آيةُ — مُحَمَّـد!"), "ايهمحمد");
+  assert.equal(normalizeOcrName("فاطمة الزهراء"), "فاطمهالزهراء");
+  assert.equal(normalizeOcrName("John Smith"), "johnsmith");
+  assert.equal(normalizeOcrName(""), "");
+  assert.equal(normalizeOcrName(null), "");
+});
+
+test("checkScreenshotOcrText: a DIFFERENT name rejects as name-mismatch (another student's screenshot)", () => {
+  // Right code, wrong name: the cheat the user showed — a screenshot of
+  // someone else's chat (or the example image) where the number shows
+  // saved, but the name in it is not the uploader's.
+  assert.deepEqual(
+    checkScreenshotOcrText("Coptic\nتم التسجيل، الرقم الكودي الخاص بي: 13312860، اسمي: أحمد محمد علي", "13312860", "لمياء وائل شرف"),
+    { verdict: "name-mismatch" },
+  );
+});
+
+test("checkScreenshotOcrText: right name, wrong code rejects as no-code (code is the strict check)", () => {
+  assert.deepEqual(
+    checkScreenshotOcrText("Coptic\nتم التسجيل، الرقم الكودي الخاص بي: 99999999، اسمي: لمياء وائل شرف", "13312860", "لمياء وائل شرف"),
+    { verdict: "no-code" },
+  );
+});
+
+test("checkScreenshotOcrText: name with diacritics / hamza variation still accepts", () => {
+  // Stored "أحمد محمد", OCR reads it with tashkeel or without hamza —
+  // normalization makes both sides the same.
+  assert.deepEqual(
+    checkScreenshotOcrText("Coptic\nتم التسجيل، الرقم الكودي الخاص بي: 13312860، اسمي: أَحْمَد مُحَمَّد", "13312860", "أحمد محمد"),
+    { verdict: "ok" },
+  );
+  assert.deepEqual(
+    checkScreenshotOcrText("Coptic\nتم التسجيل، الرقم الكودي الخاص بي: 13312860، اسمي: احمد محمد", "13312860", "أحمد محمد"),
+    { verdict: "ok" },
+  );
+});
+
+test("checkScreenshotOcrText: empty stored name skips the name check (fail open)", () => {
+  assert.deepEqual(
+    checkScreenshotOcrText("Coptic\nتم التسجيل، الرقم الكودي الخاص بي: 13312860، اسمي: أحمد محمد علي", "13312860", ""),
+    { verdict: "ok" },
+  );
+  assert.deepEqual(
+    checkScreenshotOcrText("Coptic\nتم التسجيل، الرقم الكودي الخاص بي: 13312860", "13312860", null),
+    { verdict: "ok" },
+  );
 });
 
 function ocrFetch(result) {
@@ -103,6 +152,20 @@ test("verifyScreenshotOcr: OCR error / empty text → skipped", async () => {
   assert.deepEqual(
     await verifyScreenshotOcr(bytes, "13312860", "test-key", async () => { throw new Error("network down"); }),
     { verdict: "skipped" },
+  );
+});
+
+test("verifyScreenshotOcr: name check runs through the OCR path (own name ok, other name name-mismatch)", async () => {
+  const bytes = new Uint8Array([1, 2, 3]);
+  const own = "Coptic\nتم التسجيل، الرقم الكودي الخاص بي: 13312860، اسمي: لمياء وائل شرف";
+  const other = "Coptic\nتم التسجيل، الرقم الكودي الخاص بي: 13312860، اسمي: أحمد محمد علي";
+  assert.deepEqual(
+    await verifyScreenshotOcr(bytes, "13312860", "test-key", ocrFetch({ OCRExitCode: 1, IsErroredOnProcessing: false, ParsedResults: [{ ParsedText: own }] }), "لمياء وائل شرف"),
+    { verdict: "ok" },
+  );
+  assert.deepEqual(
+    await verifyScreenshotOcr(bytes, "13312860", "test-key", ocrFetch({ OCRExitCode: 1, IsErroredOnProcessing: false, ParsedResults: [{ ParsedText: other }] }), "لمياء وائل شرف"),
+    { verdict: "name-mismatch" },
   );
 });
 

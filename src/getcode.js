@@ -74,14 +74,14 @@ export function buildGetCodeReply(name, code) {
   return `لتفعيل اشتراكك، سجّل هذا الرقم +${GET_CODE_WHATSAPP_NUMBER} في جهات اتصالك أولاً، ثم اضغط على رابط الواتساب التالي:\n${buildGetCodeWhatsAppUrl(code, name)}\nلفتح المحادثة مع الرقم على الواتساب، ثم التقط Screenshot للشاشة على سبيل المثال مثل الشكل الموضح في الصورة المرفقة، ثم أرسلها هنا في الشات لإتمام التفعيل.`;
 }
 
-// Rejection texts for the screenshot OCR verification (2026-11-28).
-// Both keep the wait open so the student can send a better screenshot.
-// The unsaved-number text is the user's EXACT wording (28 Nov
-// correction — no emoji, no phone number in it; it deliberately differs
-// from Telegram's draft): «قم برفع صورة مضبوطة تُوضح أن الرقم مسجل في
-// جهات اتصالك.»
-export const GET_CODE_SCREENSHOT_UNSAVED_TEXT = "قم برفع صورة مضبوطة تُوضح أن الرقم مسجل في جهات اتصالك.";
-export const GET_CODE_SCREENSHOT_NO_CODE_TEXT = "⚠️ رسالة التسجيل مش ظاهرة في السكرين — اتأكد إنك بعت الرسالة على الواتساب، وبعدين ابعت سكرين شوت تاني.";
+// The rejection text for the screenshot OCR verification (2026-11-28).
+// ONE text for ALL screenshot rejections — the user's EXACT wording,
+// final version 28 Nov ~04:33 (adds «، وواضح في الصورة اسمك ورقمك
+// الكودي» to the version just deployed): unsaved number, missing code
+// and wrong name all send this same line, and the wait stays open so
+// the student can send a better screenshot. The earlier no-code draft
+// («⚠️ رسالة التسجيل مش ظاهرة...») is RETIRED.
+export const GET_CODE_SCREENSHOT_UNSAVED_TEXT = "قم برفع صورة مضبوطة تُوضح أن الرقم مسجل في جهات اتصالك، وواضح في الصورة اسمك ورقمك الكودي.";
 
 // Screenshot verification (2026-11-28, Telegram parity —
 // ~/workspace/final-code-fix/src/getcode.js): OCR.space free tier —
@@ -111,19 +111,47 @@ export function normalizeOcrDigits(text) {
     .replace(/\D/gu, "");
 }
 
+// Name matching for the anti-cheat check (28 Nov 2026): the
+// screenshot must show THE STUDENT'S OWN name, not just any name —
+// a student could otherwise upload someone else's screenshot (or the
+// bot's own example image) where the number shows saved as "Coptic"
+// but the code/name in it are not theirs. Normalize both sides the
+// same way: strip Arabic diacritics (tashkeel) and tatweel, unify
+// أ/إ/آ → ا, ى → ي, ة → ه, drop spaces and punctuation, lowercase
+// Latin. The normalized full name must appear in the normalized OCR
+// text.
+export function normalizeOcrName(text) {
+  return String(text ?? "")
+    .replace(/[\u064B-\u0655\u0670\u0640]/gu, "")
+    .replace(/[أإآ]/gu, "ا")
+    .replace(/ى/gu, "ي")
+    .replace(/ة/gu, "ه")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]/gu, "");
+}
+
 // The user's rule (2026-11-28): the screenshot is REJECTED when the
 // admin number shows as raw digits (unsaved); it is ACCEPTED only when
 // the number shows saved as a contact name — in ANY language, so no
 // specific name is ever checked: the absence of the phone digits is
 // what proves the number is saved. A second check rejects screenshots
 // that do not show the student's code at all (the registration message
-// was not sent/shown). Whole-text digit concatenation is used so a
-// number OCR splits with spaces ("+20 120 782 9388") is still caught.
-export function checkScreenshotOcrText(ocrText, code) {
+// was not sent/shown). A third check (anti-cheat, 28 Nov ~04:33)
+// rejects screenshots that do not show THE STUDENT'S OWN name — the
+// code check is the strict one, the name check is defense-in-depth;
+// an empty normalized name skips the name check (fail open).
+// Whole-text digit concatenation is used so a number OCR splits with
+// spaces ("+20 120 782 9388") is still caught. Check order:
+// (1) phone digits present → unsaved-number; (2) student's code
+// absent → no-code; (3) student's name absent → name-mismatch;
+// (4) accept only when all pass.
+export function checkScreenshotOcrText(ocrText, code, name) {
   const digits = normalizeOcrDigits(ocrText);
   if (digits.includes(GET_CODE_WHATSAPP_NUMBER) || digits.includes(GET_CODE_WHATSAPP_NUMBER.slice(2))) return { verdict: "unsaved-number" };
   const codeDigits = normalizeOcrDigits(code);
   if (!codeDigits || !digits.includes(codeDigits)) return { verdict: "no-code" };
+  const nameNorm = normalizeOcrName(name);
+  if (nameNorm && !normalizeOcrName(ocrText).includes(nameNorm)) return { verdict: "name-mismatch" };
   return { verdict: "ok" };
 }
 
@@ -167,13 +195,15 @@ export async function ocrScreenshotText(imageBytes, apiKey, fetchImpl = fetch) {
 }
 
 // OCR + check in one step. Verdicts: "ok" (activate), "unsaved-number"
-// / "no-code" (reject, wait stays open), "skipped" (no key, oversize,
-// OCR error or empty text — the caller fails open and activates).
-export async function verifyScreenshotOcr(imageBytes, code, apiKey, fetchImpl = fetch) {
+// / "no-code" / "name-mismatch" (reject, wait stays open), "skipped" (no
+// key, oversize, OCR error or empty text — the caller fails open and
+// activates). `name` is the uploading student's stored name (optional —
+// an empty name skips the name check).
+export async function verifyScreenshotOcr(imageBytes, code, apiKey, fetchImpl = fetch, name = null) {
   if (!apiKey) return { verdict: "skipped" };
   const { text, error } = await ocrScreenshotText(imageBytes, apiKey, fetchImpl);
   if (error || text == null) return { verdict: "skipped" };
-  return checkScreenshotOcrText(text, code);
+  return checkScreenshotOcrText(text, code, name);
 }
 
 // POST {name, phone} to the bot's Apps Script web app (apps-script/Code.gs).

@@ -75,7 +75,6 @@ import {
   getCodePhoneValid,
   GET_CODE_EXAMPLE_PHOTO_URL,
   GET_CODE_SCREENSHOT_UNSAVED_TEXT,
-  GET_CODE_SCREENSHOT_NO_CODE_TEXT,
   verifyScreenshotOcr,
 } from "./getcode.js";
 import { copticNameReply } from "./coptic-name.js";
@@ -1476,7 +1475,7 @@ export function createMessengerParity(deps = {}) {
     // name/phone. The stored name+code persist after the screenshot wait
     // clears (only the wait flag is ever cleared, never the record).
     if (state?.getcodeScreenshotName && state?.getcodeScreenshotCode) {
-      return { ...textPlan(`مرحباً، ${state.getcodeScreenshotName}، الرقم الكودي الخاص بك هو ${state.getcodeScreenshotCode}`), getCodeReply: true };
+      return { ...textPlan(`مرحباً ${state.getcodeScreenshotName}، الرقم الكودي الخاص بك هو ${state.getcodeScreenshotCode}`), getCodeReply: true };
     }
     await commit(senderId, state, {
       ...clearFlows, getcodeStep: "name", getcodeName: undefined,
@@ -1557,33 +1556,32 @@ export function createMessengerParity(deps = {}) {
   // screenshot back. On the WEBHOOK path the image arrives with its
   // Facebook CDN attachment URL (image.payload.url — expires, so it is
   // downloaded immediately) and is OCR-verified FIRST: the admin number
-  // showing as raw digits (unsaved) or a missing code are REJECTED with
-  // the wait left open so the student can re-send; any OCR problem fails
-  // open to the activation below. On the /botcake path the image arrives
-  // as an empty-text call with NO bytes (image is null) — OCR cannot
-  // run there, so it always fails open to the activation. Only an
-  // accepted screenshot confirms the activation with their name + code
-  // from the just-completed session. One shot: only the wait flag clears
-  // on receipt (the stored name+code persist for returning users), so a
-  // later unrelated image does not repeat it. An image without a
-  // completed get-code session returns null (normal handling — on the
-  // webhook path that means silence, as today). The plan carries
-  // getCodeReply so the /botcake path direct-sends it (the flow would
-  // drop it otherwise); on the webhook path the flag is ignored and
-  // the text is sent directly.
+  // showing as raw digits (unsaved), a missing code, or a name that is
+  // not THE STUDENT'S OWN (anti-cheat — someone else's screenshot, or
+  // the bot's example image) are ALL rejected with the SAME single text
+  // and the wait left open so the student can re-send; any OCR problem
+  // fails open to the activation below. On the /botcake path the image
+  // arrives as an empty-text call with NO bytes (image is null) — OCR
+  // cannot run there, so it always fails open to the activation. Only
+  // an accepted screenshot confirms the activation with their name +
+  // code from the just-completed session. One shot: only the wait flag
+  // clears on receipt (the stored name+code persist for returning
+  // users), so a later unrelated image does not repeat it. An image
+  // without a completed get-code session returns null (normal handling
+  // — on the webhook path that means silence, as today). The plan
+  // carries getCodeReply so the /botcake path direct-sends it (the flow
+  // would drop it otherwise); on the webhook path the flag is ignored
+  // and the text is sent directly.
   async function handleImage(senderId, image = null) {
     const state = await load(senderId);
     if (state?.getcodeScreenshotAwaiting && state?.getcodeScreenshotName && state?.getcodeScreenshotCode) {
       const imageUrl = image?.payload?.url ?? null;
-      const verdict = await verifyGetCodeScreenshot(imageUrl, state.getcodeScreenshotCode);
-      if (verdict === "unsaved-number") {
+      const verdict = await verifyGetCodeScreenshot(imageUrl, state.getcodeScreenshotCode, state.getcodeScreenshotName);
+      if (verdict === "unsaved-number" || verdict === "no-code" || verdict === "name-mismatch") {
         return { ...textPlan(GET_CODE_SCREENSHOT_UNSAVED_TEXT), getCodeReply: true };
       }
-      if (verdict === "no-code") {
-        return { ...textPlan(GET_CODE_SCREENSHOT_NO_CODE_TEXT), getCodeReply: true };
-      }
       await commit(senderId, state, { getcodeScreenshotAwaiting: undefined });
-      return { ...textPlan(`تم تفعيل اشتراكك عزيزنا، ${state.getcodeScreenshotName} والرقم الكودي الخاص بك هو: ${state.getcodeScreenshotCode}`), getCodeReply: true };
+      return { ...textPlan(`تم تفعيل اشتراكك عزيزنا ${state.getcodeScreenshotName} والرقم الكودي الخاص بك هو: ${state.getcodeScreenshotCode}`), getCodeReply: true };
     }
     return null;
   }
@@ -1595,7 +1593,7 @@ export function createMessengerParity(deps = {}) {
   // failed download, or any OCR problem → "skipped": the caller FAILS
   // OPEN and activates as before, so a legit student is never stranded
   // by the OCR service being down.
-  async function verifyGetCodeScreenshot(imageUrl, code) {
+  async function verifyGetCodeScreenshot(imageUrl, code, name) {
     const apiKey = String(ocrApiKey ?? "").trim();
     if (!apiKey || !imageUrl) return "skipped";
     try {
@@ -1603,7 +1601,7 @@ export function createMessengerParity(deps = {}) {
       const response = await fetchFn(String(imageUrl), { signal: AbortSignal.timeout(15000) });
       if (!response?.ok) return "skipped";
       const bytes = new Uint8Array(await response.arrayBuffer());
-      return (await verifyScreenshotOcr(bytes, code, apiKey, fetchFn)).verdict;
+      return (await verifyScreenshotOcr(bytes, code, apiKey, fetchFn, name)).verdict;
     } catch {
       return "skipped";
     }

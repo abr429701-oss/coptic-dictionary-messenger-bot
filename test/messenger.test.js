@@ -208,7 +208,7 @@ test("get-code screenshot via webhook: image confirms activation once, second im
   const kvEnv = { ...env, USERS: kv };
   const calls = await sendMessengerImage({ envOverride: kvEnv });
   const texts = textMessages(calls);
-  assert.ok(texts.some((t) => /تم تفعيل اشتراكك عزيزنا، لمياء وائل شرف والرقم الكودي الخاص بك هو: 13312860/u.test(t)), "image confirms the activation");
+  assert.ok(texts.some((t) => /تم تفعيل اشتراكك عزيزنا لمياء وائل شرف والرقم الكودي الخاص بك هو: 13312860/u.test(t)), "image confirms the activation");
   const calls2 = await sendMessengerImage({ envOverride: kvEnv });
   assert.ok(!textMessages(calls2).some((t) => /تم تفعيل اشتراكك/u.test(t)), "a second image does not repeat the activation");
 });

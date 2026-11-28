@@ -191,7 +191,7 @@ test("get-code screenshot: empty-text turn confirms activation once, record pers
   assert.equal(direct.length, 1, "exactly one activation reply");
   assert.match(
     direct[0].body.message.text,
-    /تم تفعيل اشتراكك عزيزنا، أحمد محمد والرقم الكودي الخاص بك هو: 90488651/u,
+    /تم تفعيل اشتراكك عزيزنا أحمد محمد والرقم الكودي الخاص بك هو: 90488651/u,
     "activation reply carries the stored name and code",
   );
   const record = kv.store.get(`user:msgr:${PSID}`);
@@ -215,7 +215,7 @@ test("get-code returning user: greeting with the stored code, no name question",
   assert.equal(envelope.text, "", "envelope text cleared after direct send");
   const direct = directTextSends(calls);
   const allDirect = direct.map((d) => d.body.message.text).join("\n");
-  assert.match(allDirect, /مرحباً، أحمد محمد، الرقم الكودي الخاص بك هو 90488651/u, "greeting carries the stored name and code");
+  assert.match(allDirect, /مرحباً أحمد محمد، الرقم الكودي الخاص بك هو 90488651/u, "greeting carries the stored name and code");
   assert.doesNotMatch(allDirect, /اكتب اسمك/u, "no name question for a returning user");
 });
 
@@ -258,6 +258,6 @@ test("get-code screenshot: empty-text turn with OCR key set still activates, nev
   assert.equal(envelope.text, "", "envelope text cleared after direct send");
   const direct = directTextSends(calls);
   assert.equal(direct.length, 1, "exactly one activation reply");
-  assert.match(direct[0].body.message.text, /تم تفعيل اشتراكك عزيزنا، أحمد محمد والرقم الكودي الخاص بك هو: 90488651/u);
+  assert.match(direct[0].body.message.text, /تم تفعيل اشتراكك عزيزنا أحمد محمد والرقم الكودي الخاص بك هو: 90488651/u);
   assert.ok(!calls.some((c) => String(c.url).startsWith("https://api.ocr.space/")), "no OCR call without image bytes");
 });
