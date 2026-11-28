@@ -6,6 +6,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   canonicalGetCodePhone,
+  resolveGetCodeRegistryKey,
   getCodeRegistryKey,
   getCodeRegistryLookup,
   storeCodeRegistryEntry,
@@ -45,6 +46,18 @@ test("getcode registry: canonicalGetCodePhone folds to the 12-digit 20... form",
 
 test("getcode registry: the key is getcode:registry:<canonicalPhone>", () => {
   assert.equal(getCodeRegistryKey("201207829388"), "getcode:registry:201207829388");
+});
+
+test("getcode registry: resolveGetCodeRegistryKey is canonical ?? folded digits", () => {
+  assert.equal(resolveGetCodeRegistryKey("01207829388"), "201207829388", "Egyptian 11-digit → canonical");
+  assert.equal(resolveGetCodeRegistryKey("+201207829388"), "201207829388", "Egyptian 12-digit → canonical");
+  assert.equal(resolveGetCodeRegistryKey("1207829388"), "201207829388", "Egyptian 10-digit → canonical");
+  assert.equal(resolveGetCodeRegistryKey("٠١٢٠٧٨٢٩٣٨٨"), "201207829388", "Arabic-Indic Egyptian → canonical");
+  assert.equal(resolveGetCodeRegistryKey("6565666666"), "6565666666", "non-Egyptian number → folded digits");
+  assert.equal(resolveGetCodeRegistryKey("12078293"), "12078293", "short number → folded digits");
+  assert.equal(resolveGetCodeRegistryKey("442071234567"), "442071234567", "foreign number → folded digits");
+  assert.equal(resolveGetCodeRegistryKey(""), null, "empty phone → no key");
+  assert.equal(resolveGetCodeRegistryKey(null), null);
 });
 
 // ---------------------------------------------------------------------------
@@ -204,13 +217,40 @@ test("getcode registry flow: registry error fails open to the miss path", async 
   assert.match(askName.texts[0].text, /اسمك الثلاثي/u, "a registry outage never strands the student");
 });
 
-test("getcode registry flow: a non-canonical phone proceeds to the name step and the registry is never called", async () => {
+test("getcode registry flow: a non-canonical phone IS looked up (folded key); miss → name prompt", async () => {
   const fetchImpl = registryStubFetch({ entries: {} });
   const parity = makeParity({ registrySecret: REGISTRY_SECRET, fetchImpl });
   await parity.handleText(USER_PSID, "/getcode");
   const askName = await parity.handleText(USER_PSID, "١٢٠٧٨٢٩٣");
   assert.match(askName.texts[0].text, /اسمك الثلاثي/u, "an 8-digit phone is accepted, not re-asked");
-  assert.equal(fetchImpl.calls.length, 0, "no lookup without a canonical phone");
+  assert.equal(fetchImpl.calls.length, 1, "the lookup runs even without a canonical phone");
+  assert.equal(fetchImpl.calls[0].method, "GET");
+  assert.equal(fetchImpl.calls[0].phone, "12078293", "the lookup key is the folded digits");
+});
+
+test("getcode registry flow: a non-canonical phone in the registry greets immediately — no name question, no macro call", async () => {
+  const fetchImpl = registryStubFetch({ entries: { "6565666666": { name: NAME, code: "67901233" } } });
+  const parity = makeParity({ registrySecret: REGISTRY_SECRET, fetchImpl });
+  await parity.handleText(USER_PSID, "/getcode");
+  const greet = await parity.handleText(USER_PSID, "6565666666");
+  assert.match(greet.texts[0].text, new RegExp(`مرحباً ${NAME}، الرقم الكودي الخاص بك هو 67901233`, "u"));
+  assert.doesNotMatch(greet.texts[0].text, /اسمك الثلاثي/u, "no name question on a hit");
+  assert.equal(parity.macroCalls.length, 0, "no macro call on a hit");
+  assert.equal(fetchImpl.calls[0].phone, "6565666666", "the lookup key is the folded digits");
+});
+
+test("getcode registry flow: the activation write uses the folded key for a non-canonical phone", async () => {
+  const fetchImpl = registryStubFetch({ entries: {} });
+  const parity = makeParity({ registrySecret: REGISTRY_SECRET, fetchImpl });
+  await parity.handleText(USER_PSID, "/getcode");
+  await parity.handleText(USER_PSID, "12078293");
+  await parity.handleText(USER_PSID, NAME);
+  const shot = await parity.handleImage(USER_PSID);
+  assert.match(shot.texts[0].text, /تم تفعيل اشتراكك/u);
+  const posts = fetchImpl.calls.filter((c) => c.method === "POST");
+  assert.equal(posts.length, 1, "exactly one write, at activation time");
+  assert.equal(posts[0].body.phone, "12078293", "the write key is the folded digits");
+  assert.equal(posts[0].body.code, "13312860", "the code derives from the folded phone");
 });
 
 test("getcode registry flow: the entry is written ONLY at activation, never at macro success", async () => {

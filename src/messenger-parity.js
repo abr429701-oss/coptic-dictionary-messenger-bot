@@ -76,7 +76,7 @@ import {
   GET_CODE_EXAMPLE_PHOTO_URL,
   GET_CODE_SCREENSHOT_UNSAVED_TEXT,
   verifyScreenshotOcr,
-  canonicalGetCodePhone,
+  resolveGetCodeRegistryKey,
   getCodeRegistryLookup,
   storeCodeRegistryEntry,
   deleteCodeRegistryEntry,
@@ -1551,12 +1551,13 @@ export function createMessengerParity(deps = {}) {
     // validated and held in getcodePhone until the name step calls the
     // macro with (name, phone). The macro gets the folded phone as
     // typed (Western digits), never the canonical registry form.
-    // Only a too-short phone (<4 digits) is re-asked. A phone that
-    // does not canonicalize to the 12-digit "20..." registry form
-    // (e.g. a short test number) still proceeds to the name step —
-    // the registry lookup is simply skipped for it (user report,
-    // 28 Nov 2026: a correct-but-short phone must not be rejected).
-    // A registry hit greets immediately with the stored name+code (the student already got their code — and passed the
+    // Only a too-short phone (<4 digits) is re-asked. The registry
+    // lookup ALWAYS runs for a valid phone, with the resolved key
+    // (resolveGetCodeRegistryKey: the canonical 12-digit "20..." form
+    // for Egyptian numbers, the folded digits for any other number —
+    // user order 28 Nov 2026: any number syncs, not just Egyptian
+    // ones). A registry hit greets immediately with the stored
+    // name+code (the student already got their code — and passed the
     // screenshot check — on another platform); entries are written
     // only at activation time, so a hit is always an activated
     // student. Any registry error/timeout → miss path (fail open —
@@ -1566,18 +1567,15 @@ export function createMessengerParity(deps = {}) {
       if (!getCodePhoneValidMsgr(phone)) {
         return textPlan("📱 رقم الموبايل لازم يكون ٤ أرقام على الأقل — اكتبه تاني:");
       }
-      const canonical = canonicalGetCodePhone(phone);
-      if (canonical) {
-        const hit = await getCodeRegistryLookup(canonical, registryOpts());
-        if (hit?.found && hit.code) {
-          await commit(senderId, state, {
-            getcodeStep: undefined, getcodeName: undefined, getcodePhone: phone,
-            getcodeScreenshotAwaiting: undefined,
-            getcodeScreenshotName: hit.name, getcodeScreenshotCode: String(hit.code),
-            getcodeActivated: true,
-          });
-          return { ...textPlan(`مرحباً ${hit.name}، الرقم الكودي الخاص بك هو ${hit.code}`), getCodeReply: true };
-        }
+      const hit = await getCodeRegistryLookup(resolveGetCodeRegistryKey(phone), registryOpts());
+      if (hit?.found && hit.code) {
+        await commit(senderId, state, {
+          getcodeStep: undefined, getcodeName: undefined, getcodePhone: phone,
+          getcodeScreenshotAwaiting: undefined,
+          getcodeScreenshotName: hit.name, getcodeScreenshotCode: String(hit.code),
+          getcodeActivated: true,
+        });
+        return { ...textPlan(`مرحباً ${hit.name}، الرقم الكودي الخاص بك هو ${hit.code}`), getCodeReply: true };
       }
       await commit(senderId, state, { getcodeStep: "name", getcodePhone: phone });
       return textPlan("✏️ اكتب اسمك الثلاثي:");
@@ -1589,7 +1587,8 @@ export function createMessengerParity(deps = {}) {
     // missing or too short — e.g. a stale record — go back to the
     // phone question instead of guessing. A phone that does not
     // canonicalize still proceeds: the macro takes it as typed and
-    // the activation-time registry write is skipped for it.
+    // the activation-time registry write uses the resolved key
+    // (the folded digits).
     if (!getCodePhoneValidMsgr(phone)) {
       await commit(senderId, state, { getcodeStep: "phone", getcodeName: undefined });
       return textPlan("📱 اكتب رقم موبايلك:");
@@ -1676,11 +1675,9 @@ export function createMessengerParity(deps = {}) {
       // written ONLY here, never at macro-success time): the student
       // just proved the screenshot, so the other platforms may
       // recognize them instantly by phone. Fail-open: a registry
-      // outage must never block the activation reply.
-      const canonical = canonicalGetCodePhone(state.getcodePhone ?? "");
-      if (canonical) {
-        try { await storeCodeRegistryEntry(canonical, state.getcodeScreenshotName, state.getcodeScreenshotCode, registryOpts()); } catch { /* fail open */ }
-      }
+      // outage must never block the activation reply. The resolved
+      // key always exists for a valid phone (canonical, else folded).
+      try { await storeCodeRegistryEntry(resolveGetCodeRegistryKey(state.getcodePhone ?? ""), state.getcodeScreenshotName, state.getcodeScreenshotCode, registryOpts()); } catch { /* fail open */ }
       await commit(senderId, state, { getcodeScreenshotAwaiting: undefined, getcodeActivated: true });
       return { ...textPlan(`تم تفعيل اشتراكك عزيزنا ${state.getcodeScreenshotName} والرقم الكودي الخاص بك هو: ${state.getcodeScreenshotCode}`), getCodeReply: true };
     }
@@ -3574,7 +3571,7 @@ export function createMessengerParity(deps = {}) {
           // without it the reset would look broken, because the next
           // /getcode would find the registry entry and greet immediately
           // instead of re-running the flow.
-          const resetPhone = canonicalGetCodePhone(state?.getcodePhone ?? "");
+          const resetKey = resolveGetCodeRegistryKey(state?.getcodePhone ?? "");
           await commit(senderId, state, {
             getcodeStep: undefined, getcodeName: undefined,
             getcodePhone: undefined,
@@ -3582,8 +3579,8 @@ export function createMessengerParity(deps = {}) {
             getcodeScreenshotName: undefined, getcodeScreenshotCode: undefined,
             getcodeActivated: undefined,
           });
-          if (resetPhone) {
-            try { await deleteCodeRegistryEntry(resetPhone, registryOpts()); } catch { /* fail open */ }
+          if (resetKey) {
+            try { await deleteCodeRegistryEntry(resetKey, registryOpts()); } catch { /* fail open */ }
           }
           return { ...textPlan("تم مسح الرقم الكودي المسجّل — ابعت /getcode من الأول."), getCodeReply: true };
         }
