@@ -701,16 +701,15 @@ test("get-code OCR: code missing → single rejection text, wait stays open", as
   assert.equal(again.texts[0].text, "قم برفع صورة مضبوطة تُوضح أن الرقم مسجل في جهات اتصالك، وتُوضح اسمك ورقمك الكودي في شات الواتساب.", "the wait stays open after a no-code rejection");
 });
 
-test("get-code OCR: someone else's screenshot (right code, wrong name) → name-mismatch, same text, wait stays open", async () => {
-  // The cheat the user showed: the number shows saved and the code is
-  // present, but the name in the screenshot is not the uploader's.
+test("get-code OCR: a different name with the right code now activates (the name is never checked)", async () => {
+  // User rule 28 Nov 2026: the name is not checked at all — only the
+  // number being saved and the code matter. The code is unique per
+  // student, so another student's screenshot shows a different code.
   const fetchImpl = ocrStubFetch("Coptic\nتم التسجيل، الرقم الكودي الخاص بي: 13312860، اسمي: أحمد محمد علي");
   const parity = makeParity({ ocrApiKey: "test-ocr-key", fetchImpl });
   await openScreenshotWait(parity);
-  const rejected = await parity.handleImage(USER_PSID, SHOT_IMAGE);
-  assert.equal(rejected.texts[0].text, "قم برفع صورة مضبوطة تُوضح أن الرقم مسجل في جهات اتصالك، وتُوضح اسمك ورقمك الكودي في شات الواتساب.");
-  const again = await parity.handleImage(USER_PSID, SHOT_IMAGE);
-  assert.equal(again.texts[0].text, "قم برفع صورة مضبوطة تُوضح أن الرقم مسجل في جهات اتصالك، وتُوضح اسمك ورقمك الكودي في شات الواتساب.", "the wait stays open after a name-mismatch rejection");
+  const shot = await parity.handleImage(USER_PSID, SHOT_IMAGE);
+  assert.match(shot.texts[0].text, /تم تفعيل اشتراكك عزيزنا/);
 });
 
 test("get-code OCR: no key configured → skipped, activation as before, zero OCR calls", async () => {

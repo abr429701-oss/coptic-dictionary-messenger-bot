@@ -111,30 +111,6 @@ export function normalizeOcrDigits(text) {
     .replace(/\D/gu, "");
 }
 
-// Name matching for the anti-cheat check (28 Nov 2026): the
-// screenshot must show THE STUDENT'S OWN name, not just any name —
-// a student could otherwise upload someone else's screenshot (or the
-// bot's own example image) where the number shows saved as "Coptic"
-// but the code/name in it are not theirs. Normalize both sides the
-// same way: strip Arabic diacritics (tashkeel) and tatweel, unify
-// أ/إ/آ → ا, ى → ي, ة → ه, drop spaces and punctuation, lowercase
-// Latin. The normalized full name must appear in the normalized OCR
-// text. Only Arabic letters, Latin letters and digits are CHECKABLE:
-// OCR.space (Arabic+English+digits) never returns Coptic or Greek
-// letters, so a Coptic/Greek-only name normalizes to "" here and the
-// name check is skipped — the code-digit check still applies, so a
-// correct screenshot is never rejected for its name's script. A mixed
-// name (Arabic + Coptic) is checked on its Arabic part.
-export function normalizeOcrName(text) {
-  return String(text ?? "")
-    .replace(/[\u064B-\u0655\u0670\u0640]/gu, "")
-    .replace(/[أإآ]/gu, "ا")
-    .replace(/ى/gu, "ي")
-    .replace(/ة/gu, "ه")
-    .toLowerCase()
-    .replace(/[^0-9A-Za-z\u0600-\u06FF]/gu, "");
-}
-
 // The user's rule (2026-11-28): the screenshot is REJECTED when the
 // admin number shows as raw digits (unsaved); it is ACCEPTED only when
 // the number shows saved as a contact name — in ANY language, so no
@@ -142,21 +118,20 @@ export function normalizeOcrName(text) {
 // what proves the number is saved. A second check rejects screenshots
 // that do not show the student's code at all (the registration message
 // was not sent/shown). A third check (anti-cheat, 28 Nov ~04:33)
-// rejects screenshots that do not show THE STUDENT'S OWN name — the
-// code check is the strict one, the name check is defense-in-depth;
-// an empty normalized name skips the name check (fail open).
-// Whole-text digit concatenation is used so a number OCR splits with
-// spaces ("+20 120 782 9388") is still caught. Check order:
-// (1) phone digits present → unsaved-number; (2) student's code
-// absent → no-code; (3) student's name absent → name-mismatch;
-// (4) accept only when all pass.
+// The user's rule (28 Nov ~05:21): the name is NOT checked at all —
+// the point is only that the number is registered and the code is the
+// student's own. The code is unique per student, so another student's
+// screenshot shows a different code (→ no-code) and the example image
+// has no code at all (→ no-code). Check order: (1) phone digits
+// present → unsaved-number; (2) student's code absent → no-code;
+// (3) accept. Whole-text digit concatenation is used so a number OCR
+// splits with spaces ("+20 120 782 9388") is still caught.
 export function checkScreenshotOcrText(ocrText, code, name) {
+  void name; // kept for the call sites — the name is never checked.
   const digits = normalizeOcrDigits(ocrText);
   if (digits.includes(GET_CODE_WHATSAPP_NUMBER) || digits.includes(GET_CODE_WHATSAPP_NUMBER.slice(2))) return { verdict: "unsaved-number" };
   const codeDigits = normalizeOcrDigits(code);
   if (!codeDigits || !digits.includes(codeDigits)) return { verdict: "no-code" };
-  const nameNorm = normalizeOcrName(name);
-  if (nameNorm && !normalizeOcrName(ocrText).includes(nameNorm)) return { verdict: "name-mismatch" };
   return { verdict: "ok" };
 }
 

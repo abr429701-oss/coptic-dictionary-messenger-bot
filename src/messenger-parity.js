@@ -1594,7 +1594,7 @@ export function createMessengerParity(deps = {}) {
     if (state?.getcodeScreenshotAwaiting && state?.getcodeScreenshotName && state?.getcodeScreenshotCode) {
       const imageUrl = image?.payload?.url ?? null;
       const verdict = await verifyGetCodeScreenshot(imageUrl, state.getcodeScreenshotCode, state.getcodeScreenshotName);
-      if (verdict === "unsaved-number" || verdict === "no-code" || verdict === "name-mismatch") {
+      if (verdict === "unsaved-number" || verdict === "no-code") {
         return { ...textPlan(GET_CODE_SCREENSHOT_UNSAVED_TEXT), getCodeReply: true };
       }
       await commit(senderId, state, { getcodeScreenshotAwaiting: undefined, getcodeActivated: true });
