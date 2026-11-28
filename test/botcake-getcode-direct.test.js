@@ -85,10 +85,11 @@ function directImageSends(calls) {
   return calls.filter((c) => c.url === MESSENGER_SEND_URL && c.body?.message?.attachment?.type === "image");
 }
 
-function seedGetCodePhone(kv) {
+function seedGetCodeName(kv) {
+  // Phone already given (phone-first order); the flow waits for the name.
   kv.store.set(`user:msgr:${PSID}`, {
     name: "Tester",
-    parity: { getcodeStep: "phone", getcodeName: "أحمد محمد" },
+    parity: { getcodeStep: "name", getcodePhone: "01289254084" },
   });
 }
 
@@ -107,12 +108,12 @@ function seedGetCodeDone(kv, { wait = false } = {}) {
 // directly as ONE whole message (never split — the long wa.me link
 // would be cut mid-URL by the envelope splitter), then the example
 // screenshot image, and the envelope must be fully cleared (no double).
-test("get-code phone turn: whole reply text, then example image, envelope cleared", async () => {
+test("get-code name turn: whole reply text, then example image, envelope cleared", async () => {
   const kv = fakeKv();
-  seedGetCodePhone(kv);
+  seedGetCodeName(kv);
   const calls = [];
   const { envelope } = await postBotcake(
-    { psid: PSID, text: "01289254084" },
+    { psid: PSID, text: "أحمد محمد" },
     kv,
     calls,
     { success: true, code: "90488651", message: "ok" },
@@ -160,10 +161,10 @@ test("get-code phone turn: whole reply text, then example image, envelope cleare
 // otherwise the student gets silence instead of the registration link.
 test("get-code macro failure: fallback sent directly, envelope cleared", async () => {
   const kv = fakeKv();
-  seedGetCodePhone(kv);
+  seedGetCodeName(kv);
   const calls = [];
   const { envelope } = await postBotcake(
-    { psid: PSID, text: "01289254084" },
+    { psid: PSID, text: "أحمد محمد" },
     kv,
     calls,
     { success: false },
@@ -221,12 +222,12 @@ test("get-code returning user: greeting with the stored code, no name question",
 
 // First-time user: no stored record — the name question rides the
 // envelope (no direct send needed for a short ask).
-test("get-code first-time user: asks for the name", async () => {
+test("get-code first-time user: asks for the phone", async () => {
   const kv = fakeKv();
   kv.store.set(`user:msgr:${PSID}`, { name: "Tester" });
   const calls = [];
   const { envelope } = await postBotcake({ psid: PSID, text: "/getcode" }, kv, calls, { success: true, code: "90488651" });
-  assert.match(envelope.text, /اكتب اسمك الثلاثي/u, "first-time user is asked for the name");
+  assert.match(envelope.text, /اكتب رقم موبايلك/u, "first-time user is asked for the phone");
   assert.doesNotMatch(envelope.text, /مرحباً/u, "no returning-user greeting without a record");
 });
 

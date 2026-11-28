@@ -1179,6 +1179,7 @@ export function createMessengerParity(deps = {}) {
 
   const clearFlows = {
     certAwaiting: undefined, getcodeStep: undefined, getcodeName: undefined,
+    getcodePhone: undefined,
     getcodeScreenshotAwaiting: undefined,
     examAwaiting: undefined, copticNameAwaiting: undefined,
     pendingBroadcast: undefined, pendingConfirm: undefined, menuList: undefined,
@@ -1432,6 +1433,7 @@ export function createMessengerParity(deps = {}) {
       lastLevelId: level.id,
       examAwaiting: exam ? { formId: exam.formId, examUrl: exam.examUrl, lessonId } : undefined,
       certAwaiting: undefined, getcodeStep: undefined, getcodeName: undefined,
+      getcodePhone: undefined,
       getcodeScreenshotAwaiting: undefined,
       pendingBroadcast: undefined, recordState: undefined, recordPick: undefined,
       menuList: { kind: "learn-nav", lessonId },
@@ -1488,9 +1490,9 @@ export function createMessengerParity(deps = {}) {
       return { ...textPlan(`مرحباً ${state.getcodeScreenshotName}، الرقم الكودي الخاص بك هو ${state.getcodeScreenshotCode}`), getCodeReply: true };
     }
     await commit(senderId, state, {
-      ...clearFlows, getcodeStep: "name", getcodeName: undefined,
+      ...clearFlows, getcodeStep: "phone", getcodePhone: undefined,
     });
-    return textPlan("✏️ اكتب اسمك الثلاثي:");
+    return textPlan("📱 اكتب رقم موبايلك:");
   }
 
   // /copticname — كتابة الاسم بالحروف القبطية (طلب المستخدم 27 نوفمبر 2026).
@@ -1513,18 +1515,22 @@ export function createMessengerParity(deps = {}) {
   }
 
   async function handleGetCodeStep(senderId, state, text) {
-    if (state.getcodeStep === "name") {
-      const name = String(text ?? "").trim();
-      if (!name) return textPlan("✏️ اكتب اسمك الثلاثي:");
-      await commit(senderId, state, { getcodeStep: "phone", getcodeName: name });
-      return textPlan("📱 اكتب رقم موبايلك:");
+    // Order (user, 28 Nov 2026): phone FIRST, then name. The phone is
+    // validated and held in getcodePhone until the name step calls the
+    // macro with (name, phone). The macro gets the folded phone as
+    // typed (Western digits), never the canonical registry form.
+    if (state.getcodeStep === "phone") {
+      const phone = normalizeGetCodePhoneMsgr(text);
+      if (!getCodePhoneValidMsgr(phone)) {
+        return textPlan("📱 رقم الموبايل لازم يكون ٤ أرقام على الأقل — اكتبه تاني:");
+      }
+      await commit(senderId, state, { getcodeStep: "name", getcodePhone: phone });
+      return textPlan("✏️ اكتب اسمك الثلاثي:");
     }
-    const phone = normalizeGetCodePhoneMsgr(text);
-    if (!getCodePhoneValidMsgr(phone)) {
-      return textPlan("📱 رقم الموبايل لازم يكون ٤ أرقام على الأقل — اكتبه تاني:");
-    }
-    const name = String(state.getcodeName ?? "").trim();
-    await commit(senderId, state, { getcodeStep: undefined, getcodeName: undefined, getcodeScreenshotAwaiting: undefined });
+    const name = String(text ?? "").trim();
+    if (!name) return textPlan("✏️ اكتب اسمك الثلاثي:");
+    const phone = String(state.getcodePhone ?? "").trim();
+    await commit(senderId, state, { getcodeStep: undefined, getcodePhone: undefined, getcodeScreenshotAwaiting: undefined });
     let result;
     try {
       result = await getCode(name, phone, macroUrl);
@@ -1543,7 +1549,7 @@ export function createMessengerParity(deps = {}) {
       // (getCodePhotoReply block in src/index.js, like /share) so the
       // long wa.me link never hits the Botcake chunk splitter.
       await commit(senderId, state, {
-        getcodeStep: undefined, getcodeName: undefined,
+        getcodeStep: undefined, getcodeName: undefined, getcodePhone: undefined,
         getcodeScreenshotAwaiting: true, getcodeScreenshotName: name, getcodeScreenshotCode: String(result.code),
       });
       return {
@@ -3479,8 +3485,8 @@ export function createMessengerParity(deps = {}) {
           // Hidden admin-only (28 Nov 2026, Telegram parity): the admin
           // already has a stored code, so /getcode only greets him and
           // never re-asks — this clears his own stored name+code (and
-          // any open get-code wait), so the next /getcode asks for name,
-          // then phone, and runs the full flow again. Same phone → same
+          // any open get-code wait), so the next /getcode asks for phone,
+          // then name, and runs the full flow again. Same phone → same
           // code (last 8 digits + 1234567); the reset re-opens the FLOW,
           // it never mints a new code. Non-admins never reach here
           // (ADMIN_COMMANDS gate above returns silence). getCodeReply
@@ -3488,6 +3494,7 @@ export function createMessengerParity(deps = {}) {
           // drop the confirmation.
           await commit(senderId, state, {
             getcodeStep: undefined, getcodeName: undefined,
+            getcodePhone: undefined,
             getcodeScreenshotAwaiting: undefined,
             getcodeScreenshotName: undefined, getcodeScreenshotCode: undefined,
             getcodeActivated: undefined,

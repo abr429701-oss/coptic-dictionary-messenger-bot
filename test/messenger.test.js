@@ -1248,17 +1248,17 @@ test("wiring: bare number routes to the parity menu when the menu is newest", as
   assert.match(texts, /درس/u, "number 1 opens the first level's lessons");
 });
 
-test("wiring: /cert1 asks for the code; /getcode walks name -> phone -> instructions (no macro URL)", async () => {
+test("wiring: /cert1 asks for the code; /getcode walks phone -> name -> instructions (no macro URL)", async () => {
   const kv = fakeKv();
   const kvEnv = { ...env, USERS: kv };
   let calls = await sendMessengerText("/cert1", { envOverride: kvEnv });
   assert.match(calls.at(-1).payload.message.text, /أدخل الرقم الكودي/u);
   await sendMessengerText("/cancel", { envOverride: kvEnv });
   calls = await sendMessengerText("/getcode", { envOverride: kvEnv });
-  assert.match(calls.at(-1).payload.message.text, /اكتب اسمك الثلاثي/u);
-  calls = await sendMessengerText("أحمد محمد علي", { envOverride: kvEnv });
   assert.match(calls.at(-1).payload.message.text, /اكتب رقم موبايلك/u);
   calls = await sendMessengerText("01234567890", { envOverride: kvEnv });
+  assert.match(calls.at(-1).payload.message.text, /اكتب اسمك الثلاثي/u);
+  calls = await sendMessengerText("أحمد محمد علي", { envOverride: kvEnv });
   assert.match(calls.at(-1).payload.message.text, /تعذّر إحضار الرقم الكودي/u, "no macro URL: falls back to the registration instructions, never invents a code");
 });
 

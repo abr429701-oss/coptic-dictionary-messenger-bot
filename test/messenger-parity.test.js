@@ -466,14 +466,14 @@ test("get-code formula: code = parseInt(last 8 digits) + 1234567, Arabic-Indic d
   assert.equal(getCodePhoneValidMsgr("٠١٢٣"), true);
   assert.equal(getCodePhoneValidMsgr("١٢٣"), false);
   const parity = makeParity();
-  const askName = await parity.handleText(USER_PSID, "/getcode");
-  assert.match(askName.texts[0].text, /اسمك الثلاثي/u);
-  assert.equal(await parity.handleText(USER_PSID, "   "), null, "blank input is ignored before any flow step");
-  const askPhone = await parity.handleText(USER_PSID, "لمياء وائل شرف");
+  const askPhone = await parity.handleText(USER_PSID, "/getcode");
   assert.match(askPhone.texts[0].text, /رقم موبايلك/u);
+  assert.equal(await parity.handleText(USER_PSID, "   "), null, "blank input is ignored before any flow step");
   const shortPhone = await parity.handleText(USER_PSID, "123");
   assert.match(shortPhone.texts[0].text, /٤ أرقام على الأقل/u);
-  const done = await parity.handleText(USER_PSID, "١٢٠٧٨٢٩٣");
+  const askName = await parity.handleText(USER_PSID, "١٢٠٧٨٢٩٣");
+  assert.match(askName.texts[0].text, /اسمك الثلاثي/u);
+  const done = await parity.handleText(USER_PSID, "لمياء وائل شرف");
   // Phone 12078293 (8 digits): 12078293 + 1234567 = 13312860. The
   // success text shows NO name/code lines (corrected 28 Nov 2026) —
   // the code travels inside the wa.me link; the student first sees it
@@ -488,8 +488,8 @@ test("get-code formula: code = parseInt(last 8 digits) + 1234567, Arabic-Indic d
 test("get-code macro failure falls back to the registration instructions, never inventing a code", async () => {
   const parity = makeParity({ getCode: async () => ({ code: null, error: "macro-unreachable" }) });
   await parity.handleText(USER_PSID, "/getcode");
-  await parity.handleText(USER_PSID, "اسم الطالب");
-  const failed = await parity.handleText(USER_PSID, "01207829388");
+  await parity.handleText(USER_PSID, "01207829388");
+  const failed = await parity.handleText(USER_PSID, "اسم الطالب");
   assert.match(failed.texts[0].text, /تعذّر إحضار الرقم الكودي/u);
   assert.match(failed.texts[0].text, /201207829388/u, "fallback tells the student to contact the admin");
   assert.doesNotMatch(failed.texts[0].text, /13312860/u);
@@ -503,8 +503,8 @@ test("get-code macro failure falls back to the registration instructions, never 
 test("get-code success plan: text + example image, flagged for direct send", async () => {
   const parity = makeParity();
   await parity.handleText(USER_PSID, "/getcode");
-  await parity.handleText(USER_PSID, "لمياء وائل شرف");
-  const done = await parity.handleText(USER_PSID, "١٢٠٧٨٢٩٣");
+  await parity.handleText(USER_PSID, "١٢٠٧٨٢٩٣");
+  const done = await parity.handleText(USER_PSID, "لمياء وائل شرف");
   assert.equal(done.getCodePhotoReply, true, "success rides the direct-send block, not the envelope");
   assert.equal(done.attachments?.length, 1, "one attachment: the example screenshot");
   assert.equal(done.attachments[0].type, "image");
@@ -519,8 +519,8 @@ test("get-code success plan: text + example image, flagged for direct send", asy
 test("get-code screenshot: activation once, wait clears, record persists for returning users", async () => {
   const parity = makeParity();
   await parity.handleText(USER_PSID, "/getcode");
-  await parity.handleText(USER_PSID, "لمياء وائل شرف");
   await parity.handleText(USER_PSID, "١٢٠٧٨٢٩٣");
+  await parity.handleText(USER_PSID, "لمياء وائل شرف");
   const shot = await parity.handleImage(USER_PSID);
   assert.match(shot.texts[0].text, /تم تفعيل اشتراكك عزيزنا لمياء وائل شرف والرقم الكودي الخاص بك هو: 13312860/u);
   assert.equal(await parity.handleImage(USER_PSID), null, "a second image does not repeat the activation");
@@ -541,8 +541,8 @@ test("get-code screenshot with no completed session: silence", async () => {
 test("get-code /cancel clears the screenshot wait but keeps the record", async () => {
   const parity = makeParity();
   await parity.handleText(USER_PSID, "/getcode");
-  await parity.handleText(USER_PSID, "لمياء وائل شرف");
   await parity.handleText(USER_PSID, "١٢٠٧٨٢٩٣");
+  await parity.handleText(USER_PSID, "لمياء وائل شرف");
   await parity.handleText(USER_PSID, "/cancel");
   assert.equal(await parity.handleImage(USER_PSID), null, "the wait is gone after /cancel");
   const again = await parity.handleText(USER_PSID, "/getcode");
@@ -552,29 +552,29 @@ test("get-code /cancel clears the screenshot wait but keeps the record", async (
 // /resetcode (28 Nov 2026, Telegram parity): hidden admin-only — the
 // admin already has a stored code, so /getcode only greets him and he
 // can never re-test the full flow. It clears his own stored record
-// (and any open wait), so the next /getcode asks for the name again.
+// (and any open wait), so the next /getcode asks for the phone again.
 // Same phone → same code (the code is derived from the phone); the
 // reset re-opens the FLOW, it never mints a new code.
-test("get-code /resetcode (admin) clears the stored record and the next /getcode asks for the name again", async () => {
+test("get-code /resetcode (admin) clears the stored record and the next /getcode asks for the phone again", async () => {
   const parity = makeParity();
   await parity.handleText(ADMIN_PSID, "/getcode");
-  await parity.handleText(ADMIN_PSID, "ابرام مرزق");
   await parity.handleText(ADMIN_PSID, "١٢٠٧٨٢٩٣");
+  await parity.handleText(ADMIN_PSID, "ابرام مرزق");
   const again = await parity.handleText(ADMIN_PSID, "/getcode");
   assert.match(again.texts[0].text, /مرحباً ابرام مرزق/u, "record exists before the reset");
   const reset = await parity.handleText(ADMIN_PSID, "/resetcode");
   assert.equal(reset.texts[0].text, "تم مسح الرقم الكودي المسجّل — ابعت /getcode من الأول.");
   assert.equal(reset.getCodeReply, true, "confirmation rides the direct send, like other get-code replies");
   const fresh = await parity.handleText(ADMIN_PSID, "/getcode");
-  assert.match(fresh.texts[0].text, /اكتب اسمك الثلاثي/u, "the next /getcode asks for the name again");
+  assert.match(fresh.texts[0].text, /اكتب رقم موبايلك/u, "the next /getcode asks for the phone again");
   assert.doesNotMatch(fresh.texts[0].text, /مرحباً/u);
 });
 
 test("get-code /resetcode (non-admin) is silent and the record survives", async () => {
   const parity = makeParity();
   await parity.handleText(USER_PSID, "/getcode");
-  await parity.handleText(USER_PSID, "لمياء وائل شرف");
   await parity.handleText(USER_PSID, "١٢٠٧٨٢٩٣");
+  await parity.handleText(USER_PSID, "لمياء وائل شرف");
   const reset = await parity.handleText(USER_PSID, "/resetcode");
   assert.deepEqual(reset.texts, [], "non-admins get silence, no leak of the admin surface");
   const again = await parity.handleText(USER_PSID, "/getcode");
@@ -584,8 +584,8 @@ test("get-code /resetcode (non-admin) is silent and the record survives", async 
 test("get-code /resetcode clears an open screenshot wait too", async () => {
   const parity = makeParity();
   await parity.handleText(ADMIN_PSID, "/getcode");
-  await parity.handleText(ADMIN_PSID, "ابرام مرزق");
   await parity.handleText(ADMIN_PSID, "١٢٠٧٨٢٩٣");
+  await parity.handleText(ADMIN_PSID, "ابرام مرزق");
   await parity.handleText(ADMIN_PSID, "/resetcode");
   assert.equal(await parity.handleImage(ADMIN_PSID), null, "the wait is gone after /resetcode");
 });
@@ -622,8 +622,8 @@ function ocrStubFetch(ocrText, { ocrError = false, ocrEmpty = false, downloadErr
 
 async function openScreenshotWait(parity, psid = USER_PSID) {
   await parity.handleText(psid, "/getcode");
-  await parity.handleText(psid, "لمياء وائل شرف");
   await parity.handleText(psid, "١٢٠٧٨٢٩٣"); // code 13312860
+  await parity.handleText(psid, "لمياء وائل شرف");
 }
 
 test("get-code OCR: saved name + code present → activation, wait clears", async () => {
